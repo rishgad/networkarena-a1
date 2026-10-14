@@ -1,0 +1,60 @@
+[schedule]
+world = "p2-sparse-12"
+seed = 1
+recovery_budget_ms = 1000
+duration_ms = 40000
+generator = 2
+
+[[failure]]
+link = [6, 10]
+down_ms = 2000
+up_ms = 3700
+blast_radius = 2
+
+[[failure]]
+link = [2, 5]
+down_ms = 5800
+up_ms = 7500
+blast_radius = 2
+
+[[failure]]
+link = [7, 11]
+down_ms = 9600
+up_ms = 11300
+blast_radius = 2
+
+[[failure]]
+link = [2, 6]
+down_ms = 13400
+up_ms = 15100
+blast_radius = 2
+
+[[failure]]
+link = [0, 6]
+down_ms = 17200
+up_ms = 18900
+blast_radius = 2
+
+[[failure]]
+link = [8, 9]
+down_ms = 21000
+up_ms = 22700
+blast_radius = 2
+
+[[failure]]
+link = [3, 8]
+down_ms = 24800
+up_ms = 26500
+blast_radius = 2
+
+[[failure]]
+link = [1, 9]
+down_ms = 28600
+up_ms = 30300
+blast_radius = 2
+
+[[failure]]
+link = [4, 5]
+down_ms = 32400
+up_ms = 34100
+blast_radius = 2

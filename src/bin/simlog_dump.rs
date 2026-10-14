@@ -37,6 +37,35 @@ fn main() {
                     println!("{:>10} ns  S{}  PROGRAM INSTALLED", f.at_ns, switch);
                 }
             }
+            LogEvent::PacketIngress { switch, port, packet } if packet.ip_proto != 254 => {
+                if switch_filter.map_or(true, |s| s == *switch) {
+                    println!(
+                        "{:>10} ns  S{}  IN       port={} proto={} src=0x{:x} dst=0x{:x} ttl={} packet={}",
+                        f.at_ns, switch, port, packet.ip_proto, packet.ip_src,
+                        packet.ip_dst, packet.ip_ttl, packet.id
+                    );
+                }
+            }
+            LogEvent::PacketEgress { switch, port, packet_id, .. } => {
+                if switch_filter.map_or(true, |s| s == *switch) {
+                    println!(
+                        "{:>10} ns  S{}  OUT      port={} packet={}",
+                        f.at_ns, switch, port, packet_id
+                    );
+                }
+            }
+            LogEvent::PacketDropped { at, reason, packet_id } => {
+                let (kind, id) = match at {
+                    competitive_net_sim::sim_log::NodeRefW::Switch(s) => ("S", *s),
+                    competitive_net_sim::sim_log::NodeRefW::App(a) => ("A", *a),
+                };
+                if switch_filter.map_or(true, |s| kind == "S" && s == id) {
+                    println!(
+                        "{:>10} ns  {}{}  DROP  {:?}  packet={}",
+                        f.at_ns, kind, id, reason, packet_id
+                    );
+                }
+            }
             LogEvent::PacketIngress { packet, .. } => {
                 if packet.ip_proto == 254 {
                     let dst = packet.ip_dst;

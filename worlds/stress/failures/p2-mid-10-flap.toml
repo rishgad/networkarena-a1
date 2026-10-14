@@ -1,0 +1,54 @@
+[schedule]
+world = "p2-mid-10"
+seed = 8
+recovery_budget_ms = 1000
+duration_ms = 40000
+generator = 2
+
+[[failure]]
+link = [2, 9]
+down_ms = 2000
+up_ms = 3200
+blast_radius = 2
+
+[[failure]]
+link = [2, 9]
+down_ms = 4300
+up_ms = 5500
+blast_radius = 2
+
+[[failure]]
+link = [2, 9]
+down_ms = 6600
+up_ms = 7800
+blast_radius = 2
+
+[[failure]]
+link = [2, 9]
+down_ms = 8900
+up_ms = 10100
+blast_radius = 2
+
+[[failure]]
+link = [2, 9]
+down_ms = 11200
+up_ms = 12400
+blast_radius = 2
+
+[[failure]]
+link = [2, 9]
+down_ms = 13500
+up_ms = 14700
+blast_radius = 2
+
+[[failure]]
+link = [2, 9]
+down_ms = 15800
+up_ms = 17000
+blast_radius = 2
+
+[[failure]]
+link = [2, 9]
+down_ms = 18100
+up_ms = 19300
+blast_radius = 2

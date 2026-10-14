@@ -1,0 +1,18 @@
+[schedule]
+world = "p2-mid-10"
+seed = 9
+recovery_budget_ms = 1000
+duration_ms = 40000
+generator = 2
+
+[[failure]]
+link = [2, 9]
+down_ms = 120
+up_ms = 1500
+blast_radius = 2
+
+[[failure]]
+link = [0, 5]
+down_ms = 3000
+up_ms = 4500
+blast_radius = 2

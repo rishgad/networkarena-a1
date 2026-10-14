@@ -1,3 +1,9 @@
 /target
 **/target
 .DS_Store
+
+# Generated simulation traces
+*.simlog
+
+# Local course handout
+/CS356_ A1 Handout.pdf

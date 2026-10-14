@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A1 Design Card</title>
+<style>
+  :root{--bg:#fff;--fg:#16161a;--muted:#5b5f6b;--rule:#d4d7de;--accent:#1b4fd8;--warn:#b3300d;--chip:#eef1f6}
+  @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#14161a;--fg:#e9ecf1;--muted:#a0a6b4;--rule:#2c313a;--accent:#7fa5ff;--warn:#ff9470;--chip:#1d2128}}
+  :root[data-theme="dark"]{--bg:#14161a;--fg:#e9ecf1;--muted:#a0a6b4;--rule:#2c313a;--accent:#7fa5ff;--warn:#ff9470;--chip:#1d2128}
+  *{box-sizing:border-box}
+  body{background:var(--bg);color:var(--fg);margin:0;padding:16px;
+    font:10px/1.3 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif}
+  .sheet{max-width:1060px;margin:0 auto}
+  header{display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap;
+    border-bottom:2px solid var(--fg);padding-bottom:3px;margin-bottom:6px}
+  h1{font-size:14px;margin:0;letter-spacing:-.2px}
+  .sub{color:var(--muted);font-size:9px}
+  .cols{column-count:3;column-gap:13px}
+  @media (max-width:900px){.cols{column-count:2}}
+  @media (max-width:600px){.cols{column-count:1}}
+  section{break-inside:avoid;margin:0 0 7px}
+  h2{font-size:9px;text-transform:uppercase;letter-spacing:.6px;color:var(--accent);
+    margin:0 0 2px;border-bottom:1px solid var(--rule);padding-bottom:1px}
+  p{margin:2px 0}
+  code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:8.8px}
+  pre{background:var(--chip);padding:3px 5px;border-radius:3px;margin:2px 0;white-space:pre;overflow-x:auto;line-height:1.28}
+  table{width:100%;border-collapse:collapse;margin:2px 0}
+  td,th{text-align:left;padding:1px 3px 1px 0;vertical-align:top}
+  th{color:var(--muted);font-weight:600;font-size:8.5px}
+  tr+tr td{border-top:1px solid var(--rule)}
+  .k{font-family:ui-monospace,Menlo,monospace;white-space:nowrap}
+  .warn{color:var(--warn);font-weight:600}
+  .note{color:var(--muted);font-style:italic}
+  ul{margin:2px 0 2px 12px;padding:0}
+  li{margin:1px 0}
+  .pagebreak{break-before:page;page-break-before:always;height:0}
+  .side{font-size:8.5px;color:var(--muted);letter-spacing:.5px;text-transform:uppercase;
+    border-bottom:1px solid var(--rule);margin:0 0 5px;padding-bottom:2px}
+  @page{size:A4 portrait;margin:8mm}
+  @media print{
+    :root{--bg:#fff;--fg:#000;--muted:#000;--rule:#999;--accent:#000;--chip:transparent;--warn:#000}
+    body{padding:0;font-size:10.8px;line-height:1.31;color:#000}
+    *{color:#000 !important;background:transparent !important}
+    pre,code{font-size:10.5px}
+    h1{font-size:17.9px} h2{font-size:10.6px}
+    .sub,th,.side{font-size:10.1px}
+    pre{border-left:2px solid #000;padding-left:4px;border-radius:0}
+    h2{border-bottom:1px solid #000;font-weight:700}
+    .warn{text-decoration:underline}
+    .cols{column-gap:10px}
+  }
+</style>
+</head>
+<body>
+<div class="sheet">
+
+<header>
+  <h1>NetworkArena A1 — Design Card</h1>
+  <div class="sub"><b>Team 25</b> · link-state · 20/20 practice · worst recovery <b>196 ms</b> of 1000 · loops 0 P1 / 4 of 15 P2 · <b>FRONT: the design</b></div>
+</header>
+
+<div class="cols">
+
+<section>
+<h2>Design in one line</h2>
+<p>Every switch shouts <b>HELLO</b> down every cable; hearing one teaches you who is on that port, and the <i>timestamp</i> is how you notice they went silent. Each switch describes only <i>itself</i> in an <b>LSA</b> and floods it; sequence numbers stop the flood looping. Everyone's LSAs = the map → <b>BFS</b> → install a next-hop port per /24. <b>Family: OSPF.</b></p>
+</section>
+
+<section>
+<h2>The two halves</h2>
+<p><b>Data plane</b> touches every packet: dumb, fast, table lookups only. Cannot think. Anything it can't match it <b>punts</b>.</p>
+<p><b>Control plane</b> (my code) is the brain: remembers, decides, fills tables. Slow; <b>only ever learns from a punt or a timer</b>.</p>
+<p class="note">The brain never sees the fast path. That split is the assignment.</p>
+</section>
+
+<section>
+<h2>Timing — and why</h2>
+<table>
+<tr><th>Const</th><th>Value</th><th>Why</th></tr>
+<tr><td class="k">TICK</td><td class="k">50 ms</td><td>HELLO cadence</td></tr>
+<tr><td class="k">DEAD</td><td class="k">150 ms</td><td><b>3 missed HELLOs</b> — one lost packet must not flap a route</td></tr>
+<tr><td class="k">REFRESH</td><td class="k">1 s</td><td>safety net if a flood is lost</td></tr>
+</table>
+<pre>detect silence  ≤150 ms
+flood network    ~1 ms   (diam 2, 100µs)
+BFS + install    ~0 ms
+─────────────────────────
+measured worst  196 ms   budget 1000</pre>
+<p class="note">500 ms hellos → 1500 ms detect → C4 fails. DEAD below TICK → neighbours expire between hellos; tested, delivery fell to <b>5.87%</b>.</p>
+</section>
+
+<section>
+<h2>Wire format — proto 89, TTL 1</h2>
+<pre>HELLO [1][sender:u32]               5 B
+LSA   [2][origin:u32][seq:u64]
+      [prefix:u32][n:u8][n×id]  18+4n B</pre>
+<p><b>Why TTL 1 if LSAs cross the network?</b> Each hop is a <i>fresh injection by that switch's controller</i>, not a forward — consumed, understood, re-emitted. So flooding needs no TTL budget and a stale LSA can't circulate.</p>
+<p><b>Why proto 89?</b> Customer traffic is proto 0. One byte cleanly separates mine from theirs.</p>
+</section>
+
+<section>
+<h2>Tables &amp; pipeline</h2>
+<pre>stage 0  load ip_proto → T_PROTO  exact
+         proto 89 → Punt(Custom 89)
+stage 1  load ip_dst  → T_ROUTE   LPM
+         /24 → SetEgress port</pre>
+<p>Without the proto-89 punt entry a HELLO falls through to the route lookup and is forwarded as ordinary traffic — <b>no switch ever learns anything</b>.</p>
+<p>T_ROUTE starts <b>empty</b>. That's why the first customer packet on every switch punts — and that punt is how I discover my own customer.</p>
+</section>
+
+<section>
+<h2>What each switch remembers</h2>
+<pre>neighbor_on_port  port → switch id
+port_of_neighbor  switch id → port
+last_heard        port → t of last HELLO
+app_port          the customer-facing port
+my_prefix         my customer's /24
+lsdb              switch id → newest LSA
+installed         prefix → port I pushed
+self_changed      re-originate my LSA?</pre>
+<p><b>Both directions of the neighbour map</b> are kept: HELLO arrives knowing the <i>port</i>; BFS answers with a <i>switch</i>. Each lookup needs the opposite key.</p>
+</section>
+
+<section>
+<h2>Five mechanisms</h2>
+<ul>
+<li><b>Neighbour discovery</b> — wire gives the port, payload gives the sender id. Neither half is enough alone.</li>
+<li><b>Prefix discovery</b> — a port that <i>never answers a HELLO</i> faces a customer. Its punted traffic's <code>ip_src &amp; 0xFFFFFF00</code> is my /24. Self-correcting: a later HELLO there undoes the guess.</li>
+<li><b>Flooding</b> — <code>seq ≤ stored</code> → drop. That one check is the entire loop prevention. Re-flood out every port <i>except</i> the ingress.</li>
+<li><b>BFS</b> — links identical (100 µs, 1 Gbps) so shortest = fewest hops; no priority queue needed.</li>
+<li><b>Failure detection</b> — no alert exists. <code>now − last_heard ≥ 150 ms</code> → drop neighbour → re-originate LSA → reflood → recompute.</li>
+</ul>
+</section>
+
+<section>
+<h2>The routing algorithm</h2>
+<pre>first_hops():
+  seen  = {me}
+  queue = []
+  for (nb,port) in alive_neighbours():   # port order
+      first[nb] = nb ; seen+=nb ; queue+=nb
+  while queue:
+      u = pop_front(queue)
+      for v in lsdb[u].neighbours:
+          if v in seen:      continue
+          if not edge(u,v):  continue   # BOTH claim
+          first[v] = first[u]
+          seen += v ; queue += v
+
+recompute():
+  want = {my_prefix: app_port}
+  for (sw,lsa) in lsdb, sw != me, lsa.prefix != 0:
+      via = first[sw]
+      want[lsa.prefix] = port_of_neighbor[via]
+  emit only the DIFFS vs `installed`
+  withdraw prefixes no longer reachable</pre>
+<p class="note">Only diffs are emitted — re-sending unchanged entries would burn the 4096-byte action budget for nothing.</p>
+</section>
+
+<section>
+<h2>Two rules against black holes</h2>
+<p><b>Bidirectional edge.</b> Believe u–v only if <i>both</i> u and v claim it. After a failure one side notices first; for a few ms their LSAs disagree, and trusting a one-sided edge routes traffic into a hole.</p>
+<p><b>Tie-break = lowest port.</b> <code>alive_neighbors()</code> iterates a <code>BTreeMap</code> keyed by port, so BFS seeds the lowest-numbered port first and it claims the destination. <b>Deterministic, never random</b> — a <code>HashMap</code> could route differently between runs.</p>
+</section>
+
+<section>
+<h2 class="warn">The trap that cost 15 runs</h2>
+<pre>install → entries.push()    APPENDS
+lookup  → returns FIRST match
+sort    → STABLE; all /24, prio 0
+⇒ the original entry never moves</pre>
+<p>An update is <b>accepted, logged, then silently ignored</b>. Part 1 passed (converge once, never update); every <i>down</i> failed; every <i>up</i> looked perfect because the stale entry became valid again. <b>Fix: <code>delete_entry</code> then <code>install_route</code>.</b></p>
+<p class="note">The tell was <b>exactly 6/12</b> recovered. Exactly half = a whole category broken, never a timing problem. Changing constants changed nothing, which ruled out detection entirely.</p>
+</section>
+
+</div>
+
+<div class="pagebreak"></div>
+
+<p class="side">Back — reading the evidence · Team 25 · A1 design card</p>
+<div class="cols">
+
+<section>
+<h2>Report card</h2>
+<table>
+<tr><td class="k">C1</td><td>delivery ≥ <b>99.9%</b> P1 / <b>98.0%</b> P2. Unique delivered ÷ unique sent. <b>Misdelivery = a loss.</b></td></tr>
+<tr><td class="k">C2</td><td>reachability — every app pair delivers ≥1 packet. One dead pair = fail.</td></tr>
+<tr><td class="k">C3</td><td>loops / TTL deaths. <b>Won't fail you</b>; burns capacity, which A2 grades.</td></tr>
+<tr><td class="k">C4</td><td>recovery &lt; <b>1000 ms</b>, P2 only. <b>Per event, never averaged.</b> Down <i>and</i> up both scored.</td></tr>
+</table>
+<p>PASS = C1 ∧ C2 ∧ (C4 pass or skipped). No partial credit inside a run.</p>
+<p class="note">Window: starts at <b>200 ms</b> warmup, stops <b>100 ms</b> before the end. Early loss is free. <b>Congestion never drops packets here</b> — so every lost packet is my program's fault.</p>
+</section>
+
+<section>
+<h2>Reading a recovery timeline</h2>
+<pre>#   t ms  link  event  silence  back   cost
+1   2110  2-4   DOWN    +0 ms  +190ms   20  ok
+2   4428  2-4   UP        -  never lost  0  ok
+3   6865  1-4   DOWN   +15 ms  +135ms   11  ok</pre>
+<p><b>silence began</b> = when HELLOs actually stopped (may lag the cut). <b>traffic back</b> = when <u>losses stopped</u>, not when routes converged. <b>cost</b> = packets lost for that event.</p>
+<p><b>"never lost one" on UP</b> = the link returned and was reused without dropping anything.</p>
+<p class="note">Detection from the cut = 150 ms − (time since last HELLO), rounded up to the next 50 ms tick → the <b>130–190 ms spread</b>, not one fixed number. That's why #1 is 190 and #3 is 135.</p>
+</section>
+
+<section>
+<h2>Reading a simlog line</h2>
+<pre>2300678520 ns  S4  delete  t2  entry id=167825920
+2300679288 ns  S4  install t2  key=0xa00d200/24
+                    -> SetEgress { port: PortIdW(2) }</pre>
+<p>ns ÷ 1e6 = ms (so 2300678520 ns = <b>2300.7 ms</b>). <code>t2</code> = T_ROUTE. entry id = the prefix as an integer. <b>delete immediately followed by install of the same key</b> = my route update, working as designed.</p>
+</section>
+
+<section>
+<h2>Tracing a path</h2>
+<pre>dest 10.0.210.1
+1 mask /24    10.0.210.0
+2 to hex      0x0a00d200
+3 find row    -> port 2
+4 PORT→NEIGHBOUR       ← never skip
+5 at that switch, repeat from 1
+6 port 100 = its app = delivered</pre>
+<p><b>Hex:</b> <code>10.0.X.0 → 0x0a00</code>+hex(X)+<code>00</code>. X÷16 = 1st digit, remainder = 2nd; a=10 … f=15.<br>
+99→<code>63</code> · 108→<code>6c</code> · 186→<code>ba</code> · 210→<code>d2</code> · 221→<code>dd</code> · 226→<code>e2</code></p>
+<p><b>The table gives a PORT, not a destination.</b> Both my quiz misses were skipping step 4.</p>
+</section>
+
+<section>
+<h2>Port numbering</h2>
+<p>Ports are handed out <b>per switch, in link-declaration order</b>, counting from 0. Walk the link list; each time a switch is named it takes its next number. <b>The two ends of one cable usually differ.</b> Port 100 = the customer app.</p>
+<pre>link 0: 5-3   S5→p0   S3→p0
+link 1: 3-1   S3→p1   S1→p0
+link 2: 3-2   S3→p2   S2→p0
+link 3: 0-5   S0→p0   S5→p1
+⇒ S3: p0=S5 p1=S1 p2=S2</pre>
+<p class="note">Sanity check any map you derive: a switch's own prefix must point at port 100, and each direct neighbour should sit on its own port.</p>
+</section>
+
+<section>
+<h2>Worked example — my run</h2>
+<p>Link <b>1-4</b> dies at 6865 ms. S1 ports: p0=S3 p1=S2 p2=S4.</p>
+<pre>before          after (7002 ms)
+10.0.108 → p2   10.0.108 → p0
+10.0.221 → p2   10.0.221 → p1</pre>
+<p>Only the two routes whose first hop was <b>p2 (=S4)</b> moved. <code>10.0.108</code> (S0) went 2 hops → <b>3 hops</b> (S1→S3→S5→S0) because no 2-hop path survives. <code>10.0.221</code> (S4) took p1 (=S2) at 2 hops, strictly shorter than via S3 — <b>no tie to break</b>. The other one <i>was</i> a tie (both 3 hops), so the lower port won.</p>
+</section>
+
+<section>
+<h2>Convergence time — max estimates</h2>
+<pre>TICK=50  DEAD=150  L=link latency  D=diameter
+cold start   ≤ TICK + D·L          = 50 + D·L
+link DOWN    ≤ DEAD+TICK + (D+1)·L = 200 + (D+1)·L
+link UP      ≤ 2·TICK + (D+1)·L    = 100 + (D+1)·L</pre>
+<p><b>Why:</b> floods are relayed <i>instantly</i> (1 L per hop). Only detection and sending my <i>own</i> LSA wait for a tick. t=0 LSAs go nowhere (no neighbours yet) → real LSAs at 50 ms. DOWN = 150 ms silence + up to 1 tick; UP = next HELLO (≤1 tick) + next LSA tick.</p>
+<p><b>Measured</b> (L=0.1 ms): cold 50.28–50.76 · DOWN 102–<b>200.0</b> (min ≈ DEAD−TICK=100) · UP 34–<b>100.3</b>. UP loses no packets.</p>
+<p class="note">Only D and L matter — not switch count, links or load. If L ≥ 50 ms, cold start waits for the first tick after L. Add ~0.03 ms/hop processing; round up slightly.</p>
+</section>
+
+<section>
+<h2>"What would happen if…" — 4 steps</h2>
+<pre>1 WHO NOTICES?  only the 2 switches on
+                that link. Nobody else can.
+2 WHEN?         ≤150 ms silence,
+                +≤50 ms to the next tick
+3 WHAT SPREADS? each endpoint re-originates
+                its OWN LSA (seq+1), floods;
+                ~1 ms to reach everyone
+4 WHAT CHANGES? only routes whose first hop
+                crossed that link</pre>
+<p><b>A link comes back:</b> HELLOs resume → neighbour re-added → <code>self_changed</code> → reflood → BFS finds the shorter path again → routes move back. Same 4 steps.</p>
+<p><b>Two links die at once:</b> both detected independently; BFS just runs on a sparser graph. Only fails if the network partitions — the handout promises it won't.</p>
+<p><b>A switch dies:</b> every neighbour sees silence; its LSA ages out of use because no edge stays bidirectional. Its prefix becomes unreachable and I <i>withdraw</i> it rather than black-hole it.</p>
+</section>
+
+<section>
+<h2>Punt reasons &amp; limits</h2>
+<pre>NoRoute       no T_ROUTE match  (customer)
+TtlExpired    hop limit hit
+Custom(89)    my own HELLO/LSA</pre>
+<table>
+<tr><td class="k">fuel</td><td>4,000,000 instr / call → trap, program dead for the run</td></tr>
+<tr><td class="k">actions</td><td>4,096 B / return (~150 installs) → call rejected</td></tr>
+<tr><td class="k">tables</td><td>16 max, 1,024 entries each</td></tr>
+</table>
+<p class="note">A dead program keeps forwarding on its last routes — from outside it looks exactly like a routing bug.</p>
+</section>
+
+<section>
+<h2>Adversary &amp; patches</h2>
+<ul>
+<li><b>Forge a HELLO</b> with someone else's id → I install a false neighbour. <i>Patch: sign/authenticate HELLOs.</i></li>
+<li><b>Replay an LSA</b> with a huge seq → accepted, and the real origin can't correct it until it exceeds that number. <i>Patch: bound seq jumps; age entries out.</i></li>
+<li><b>Lossy, not dead</b> — if some HELLOs get through I never declare it down and keep using a bad link. <i>Patch: track loss rate, not just silence.</i> (Explicitly A2's territory.)</li>
+<li><b>Flood storm</b> — force constant topology churn and my control traffic grows. <i>Patch: rate-limit re-origination.</i></li>
+<li><b>Micro-loops</b> — 0 in P1; <b>4/15</b> P2 runs (2/4/19/8 pkts). S5 notices the dead link first, reroutes via S6; S6 hasn't got the new LSA yet and points back → bounce till TTL. Transient; real OSPF has it. <i>Patch: ordered FIB updates.</i></li>
+</ul>
+</section>
+
+<section>
+<h2>Things I'd get asked and can answer</h2>
+<ul>
+<li><b>Why BFS not Dijkstra?</b> Every link is 100 µs / 1 Gbps — equal weights, so fewest hops <i>is</i> shortest. Dijkstra's queue would be wasted work.</li>
+<li><b>Why does a switch flood only its OWN LSA?</b> Nobody else can describe my adjacency truthfully; and it keeps origination rate bounded.</li>
+<li><b>Why 1 s refresh if changes reflood instantly?</b> A lost flood would otherwise leave someone stale forever.</li>
+<li><b>Why is the first packet always lost?</b> T_ROUTE starts empty; the punt is how I learn. That's inside the 200 ms warmup, so it isn't scored.</li>
+</ul>
+</section>
+
+</div>
+</div>
+</body>
+</html>
