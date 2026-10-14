@@ -1,5 +1,7 @@
 # Rust Link-State Router
 
+[![Router tests](https://github.com/rishgad/networkarena-a1/actions/workflows/ci.yml/badge.svg)](https://github.com/rishgad/networkarena-a1/actions/workflows/ci.yml)
+
 A Rust routing program that discovers neighbors, floods topology updates, and installs shortest-hop forwarding routes in the NetworkArena simulator. It detects silent link failures with periodic heartbeats and updates forwarding entries when routes change.
 
 **Baseline:** 100% scored delivery across five steady-state topologies, 99.18–99.67% delivery across fifteen failure scenarios, and **196 ms worst per-event recovery** in simulated time. See the [complete results](docs/benchmark-results.md), including transient loops.
@@ -46,6 +48,10 @@ python3 scripts/benchmark.py --output docs/benchmark-current.md
 The runner evaluates five steady-state scenarios and fifteen scheduled-failure scenarios, then writes delivery, recovery, status, and loop counts to a Markdown table. It exits unsuccessfully if a scenario fails or cannot be evaluated. `--simulator` and `--program` accept alternative executable paths.
 
 The checked-in [baseline report](docs/benchmark-results.md) records the exact router and simulator executable hashes. Recovery measures when affected traffic stops experiencing loss after a link failure or restoration. It is not a measurement of host execution speed or throughput.
+
+## Continuous integration
+
+GitHub Actions runs the simulator and SDK tests, builds the native simulator and WebAssembly router, and evaluates all 20 topology/failure scenarios on Linux. Each run includes its benchmark table and executable hashes in the job summary. See the [first successful CI run](https://github.com/rishgad/networkarena-a1/actions/runs/38514720318).
 
 ## Known limitations
 
