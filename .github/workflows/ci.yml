@@ -1,0 +1,31 @@
+name: Router tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Rust and WebAssembly target
+        run: rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown && rustup default stable
+      - name: Run simulator and SDK tests
+        run: cargo test --locked --workspace
+      - name: Build simulator
+        run: cargo build --locked --release --bin competitive_net_sim
+      - name: Build router
+        run: cargo build --release --target wasm32-unknown-unknown --manifest-path examples/my_switch/Cargo.toml
+      - name: Evaluate topology and failure scenarios
+        run: python3 scripts/benchmark.py --output docs/benchmark-current.md
+      - name: Include benchmark in run summary
+        if: always()
+        run: |
+          if [ -f docs/benchmark-current.md ]; then
+            cat docs/benchmark-current.md >> "$GITHUB_STEP_SUMMARY"
+          fi
