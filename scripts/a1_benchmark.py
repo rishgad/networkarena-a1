@@ -39,8 +39,8 @@ out=['# Router simulation results','',f'**{passed}/{len(rows)} scenarios passed.
 '| Topology | Failure schedule | Status | Delivery | Worst recovery | Looping packets |','|---|---|---|---:|---:|---:|']
 for world,failure,status,delivery,worst,loops in rows:
     out.append(f'| {world} | {failure} | {status} | {delivery:.2f}% | {str(worst)+" ms" if worst is not None else "n/a"} | {loops} |')
-out.extend(['','## Reproduction','', '```sh','cargo build --release --bin competitive_net_sim','cargo build --release --target wasm32-unknown-unknown --manifest-path examples/my_switch/Cargo.toml','python3 scripts/benchmark.py','```','',
-f'Host: {platform.system()} {platform.machine()}. The recorded run rebuilt the router from source and used the existing local simulator executable. The exact executable hashes are recorded below.','',f'- Router SHA-256: `{sha(program)}`',f'- Simulator SHA-256: `{sha(sim)}`','',
+out.extend(['','## Reproduction','', '```sh','cargo build --release --bin competitive_net_sim','cargo build --release --target wasm32-unknown-unknown --manifest-path examples/my_switch/Cargo.toml','python3 scripts/a1_benchmark.py','```','',
+f'Host: {platform.system()} {platform.machine()}. Both executables were rebuilt from source for this run. Their exact hashes are recorded below.','',f'- Router SHA-256: `{sha(program)}`',f'- Simulator SHA-256: `{sha(sim)}`','',
 'Transient loops are included in the table even when the delivery and recovery criteria pass. Results apply to these topologies and failure schedules; they do not establish behavior under arbitrary congestion, loss, or unequal link costs.',''])
 a.output.parent.mkdir(parents=True,exist_ok=True)
 a.output.write_text('\n'.join(out))
