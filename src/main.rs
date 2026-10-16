@@ -48,10 +48,20 @@ enum Cmd {
         #[arg(long)]
         failures: Option<PathBuf>,
 
+        /// Multiply every app's offered load: the same world at 0.5×, 1×,
+        /// 2× demand.
+        #[arg(long, default_value_t = 1.0)]
+        load_scale: f64,
+
         /// Print a report card at the end. Needs an event log, so one is
         /// written to a scratch file when `--log` is not given.
         #[arg(long)]
         score: bool,
+
+        /// With `--score`, also write the card as JSON to this path (the
+        /// grading pipeline reads it; the text card is for people).
+        #[arg(long)]
+        json: Option<PathBuf>,
 
         /// Ignore packets sent before this point. A program is allowed to
         /// not know the topology yet. Defaults to the world's own value.
@@ -146,7 +156,9 @@ fn main() -> std::io::Result<()> {
             log,
             until_ms,
             failures,
+            load_scale,
             score,
+            json,
             warmup_ms,
             delivery_floor_pct,
             program,
@@ -155,7 +167,9 @@ fn main() -> std::io::Result<()> {
             log,
             until_ms,
             failures,
+            load_scale,
             score,
+            json,
             warmup_ms,
             delivery_floor_pct,
             program,
@@ -166,7 +180,9 @@ fn main() -> std::io::Result<()> {
             log,
             until_ms,
             failures,
+            load_scale,
             score,
+            json,
             warmup_ms,
             delivery_floor_pct,
         } => run_world(
@@ -174,7 +190,9 @@ fn main() -> std::io::Result<()> {
             log,
             until_ms,
             failures,
+            load_scale,
             score,
+            json,
             warmup_ms,
             delivery_floor_pct,
         ),
@@ -189,7 +207,9 @@ fn run_world(
     log: Option<PathBuf>,
     until_ms: Option<u64>,
     failures: Option<PathBuf>,
+    load_scale: f64,
     score: bool,
+    json: Option<PathBuf>,
     warmup_ms: Option<u64>,
     delivery_floor_pct: Option<f64>,
     #[cfg(feature = "wasm")] program: Option<PathBuf>,
@@ -199,9 +219,15 @@ fn run_world(
     })?;
 
     // The scorer reads a log, so asking for a score means writing one.
-    // When the caller did not name a file we put it beside the world and
-    // delete it afterwards.
-    let scratch = std::env::temp_dir().join(format!("{}-score.simlog", world.world.name));
+    // When the caller did not name a file we put it in the temp directory
+    // and delete it afterwards. The name carries the pid: two processes
+    // scoring the same world at once (a parallel sweep) would otherwise
+    // share one file and read each other's half-written bytes.
+    let scratch = std::env::temp_dir().join(format!(
+        "{}-{}-score.simlog",
+        world.world.name,
+        std::process::id()
+    ));
     let log_path: Option<PathBuf> = match (&log, score) {
         (Some(p), _) => Some(p.clone()),
         (None, true) => Some(scratch.clone()),
@@ -212,7 +238,7 @@ fn run_world(
     if let Some(p) = log_path.as_ref() {
         sim.start_logging(p)?;
     }
-    let handles = world.build(&mut sim).map_err(|e| {
+    let handles = world.build_with_load(&mut sim, load_scale).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
     })?;
 
@@ -299,7 +325,10 @@ fn run_world(
     );
     let mut sent = 0u64;
     let mut recv = 0u64;
-    for (id, app) in &sim.apps {
+    // By app number, so two runs print the same lines in the same order.
+    let mut by_id: Vec<_> = sim.apps.iter().collect();
+    by_id.sort_by_key(|(id, _)| id.raw());
+    for (id, app) in by_id {
         sent += app.metrics.packets_sent;
         recv += app.metrics.packets_received;
         println!(
@@ -361,20 +390,49 @@ fn run_world(
         let prog_name = program.as_ref().map(|p| p.display().to_string());
         #[cfg(not(feature = "wasm"))]
         let prog_name: Option<String> = None;
-        let report = competitive_net_sim::score::score_file(
-            &log_path,
-            &world,
-            schedule.as_ref(),
-            prog_name,
-            &params,
-        )
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+        // A closed-loop world is graded on the A2 floors; an open-loop
+        // one on the A1 criteria.
+        let (card, passed, as_json) = match world.workload {
+            competitive_net_sim::world::Workload::Mixed { .. } => {
+                let r = competitive_net_sim::floors::score_file(
+                    &log_path,
+                    &world,
+                    prog_name,
+                    load_scale,
+                )
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+                let passed = r.status() == competitive_net_sim::floors::Status::Pass;
+                (r.render(), passed, r.to_json())
+            }
+            competitive_net_sim::world::Workload::AllPairsCbr { .. } => {
+                let r = competitive_net_sim::score::score_file(
+                    &log_path,
+                    &world,
+                    schedule.as_ref(),
+                    prog_name,
+                    &params,
+                )
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+                let passed = r.status() == competitive_net_sim::score::Status::Pass;
+                // The A1 card has no JSON form; the pipeline that grades it
+                // reads the text. Say so rather than write nothing.
+                let j = serde_json::json!({
+                    "assignment": "a1",
+                    "passed": passed,
+                    "status": if passed { "PASS" } else { "FAIL" },
+                });
+                (r.render(), passed, j)
+            }
+        };
+        if let Some(path) = &json {
+            std::fs::write(path, serde_json::to_string_pretty(&as_json)? + "\n")?;
+        }
         println!();
-        print!("{}", report.render());
+        print!("{card}");
         if log.is_none() {
             let _ = std::fs::remove_file(&log_path);
         }
-        if report.status() != competitive_net_sim::score::Status::Pass {
+        if !passed {
             std::process::exit(1);
         }
     }

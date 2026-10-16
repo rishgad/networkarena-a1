@@ -1,12 +1,14 @@
-use crate::packet::Packet;
 use crate::types::{LinkId, NodeId, PortId, SimTime};
-use std::collections::VecDeque;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy)]
 pub struct LinkConfig {
     pub latency: Duration,
     pub bandwidth_bps: u64,
+    /// Size of the drop-tail egress queue at *each end* of the link. The
+    /// queue itself lives on the node's egress port (see `egress.rs`);
+    /// this is the value that port is sized with when the link is
+    /// connected to an app. Switches size their ports at construction.
     pub queue_capacity_bytes: u64,
 }
 
@@ -18,13 +20,28 @@ impl LinkConfig {
         let nanos = (size_bytes as u128 * 8 * 1_000_000_000) / self.bandwidth_bps as u128;
         Duration::from_nanos(nanos as u64)
     }
+
+    /// For a packet that starts onto the wire at `now`: when it has fully
+    /// left the sender, and when it arrives at the far end.
+    pub fn transmit_times(&self, now: SimTime, size_bytes: u64) -> (SimTime, SimTime) {
+        let serialization_done = now + self.serialization_delay(size_bytes);
+        (serialization_done, serialization_done + self.latency)
+    }
 }
 
-/// A link from a source node/port to a destination node/port.
-///
-/// Per spec it has a drop-tail queue at the egress side and per-byte
-/// serialization plus a propagation latency. Packets are emitted from the
-/// queue in FIFO order; once serialized they spend `latency` propagating.
+/// Per-direction bookkeeping. The queue is not here: it is on the sending
+/// node's egress port, and the wire pulls from it.
+#[derive(Debug, Default)]
+pub struct Direction {
+    /// Packets refused because the link was down.
+    pub bytes_dropped: u64,
+    pub packets_dropped: u64,
+}
+
+/// A full-duplex cable between a source node/port and a destination
+/// node/port: two independent wires, each with serialization at the
+/// link's bandwidth followed by `latency` of propagation. `fwd` is the
+/// src→dst wire, `rev` the dst→src wire.
 #[derive(Debug)]
 pub struct Link {
     pub id: LinkId,
@@ -34,18 +51,12 @@ pub struct Link {
     pub dst: NodeId,
     pub dst_port: PortId,
 
-    /// Drop-tail FIFO queue (head has been popped if `serializing` is true).
-    queue: VecDeque<Packet>,
-    queued_bytes: u64,
+    pub fwd: Direction,
+    pub rev: Direction,
 
-    /// Time at which the currently-serializing packet (if any) finishes.
-    busy_until: SimTime,
-
-    /// Total bytes dropped due to overflow.
-    pub bytes_dropped: u64,
-    pub packets_dropped: u64,
-    /// When true, new enqueues are dropped. Already-queued packets still
-    /// drain. Toggle through `Simulator::fail_link` / `restore_link`.
+    /// When true, no new packet may be admitted for this link in either
+    /// direction. Packets already queued at the ports still drain. Toggle
+    /// through `Simulator::fail_link` / `restore_link`.
     pub failed: bool,
 }
 
@@ -65,69 +76,55 @@ impl Link {
             src_port,
             dst,
             dst_port,
-            queue: VecDeque::new(),
-            queued_bytes: 0,
-            busy_until: Duration::ZERO,
-            bytes_dropped: 0,
-            packets_dropped: 0,
+            fwd: Direction::default(),
+            rev: Direction::default(),
             failed: false,
         }
     }
 
-    /// Try to enqueue a packet. Returns `Some((serialization_done_at, arrive_at))`
-    /// if the packet was enqueued and we know exactly when it leaves the wire,
-    /// `None` if it was dropped due to queue overflow.
-    pub fn enqueue(&mut self, now: SimTime, packet: Packet) -> Option<(SimTime, SimTime)> {
-        if self.failed {
-            self.bytes_dropped += packet.size_bytes;
-            self.packets_dropped += 1;
-            return None;
-        }
-        if self.queued_bytes + packet.size_bytes > self.config.queue_capacity_bytes {
-            self.bytes_dropped += packet.size_bytes;
-            self.packets_dropped += 1;
-            return None;
-        }
-        self.queued_bytes += packet.size_bytes;
-
-        // The packet starts being serialized when the link becomes idle, but
-        // not before now.
-        let start = self.busy_until.max(now);
-        let serialization_done = start + self.config.serialization_delay(packet.size_bytes);
-        let arrive = serialization_done + self.config.latency;
-        self.busy_until = serialization_done;
-        self.queue.push_back(packet);
-        Some((serialization_done, arrive))
+    /// True when `node` is this link's `src` end, i.e. its packets travel
+    /// on the `fwd` wire.
+    pub fn is_src(&self, node: NodeId) -> bool {
+        self.src == node
     }
 
-    /// Remove the head packet (the one whose serialization just finished).
-    pub fn dequeue_head(&mut self) -> Option<Packet> {
-        let pkt = self.queue.pop_front()?;
-        self.queued_bytes -= pkt.size_bytes;
-        Some(pkt)
+    /// The (node, port) at the far end from `from_src`'s sender.
+    pub fn far_end(&self, from_src: bool) -> (NodeId, PortId) {
+        if from_src {
+            (self.dst, self.dst_port)
+        } else {
+            (self.src, self.src_port)
+        }
     }
 
-    pub fn queued_bytes(&self) -> u64 {
-        self.queued_bytes
+    /// The (node, port) that sends on the `from_src` wire.
+    pub fn near_end(&self, from_src: bool) -> (NodeId, PortId) {
+        if from_src {
+            (self.src, self.src_port)
+        } else {
+            (self.dst, self.dst_port)
+        }
+    }
+
+    pub fn record_link_down_drop(&mut self, from_src: bool, size_bytes: u64) {
+        let d = if from_src { &mut self.fwd } else { &mut self.rev };
+        d.bytes_dropped += size_bytes;
+        d.packets_dropped += 1;
+    }
+
+    /// Packets refused in either direction because the link was down.
+    pub fn packets_dropped(&self) -> u64 {
+        self.fwd.packets_dropped + self.rev.packets_dropped
+    }
+
+    pub fn bytes_dropped(&self) -> u64 {
+        self.fwd.bytes_dropped + self.rev.bytes_dropped
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::PacketId;
-
-    fn pkt(id: u64, size: u64) -> Packet {
-        Packet::new(PacketId::new(id), Duration::ZERO, size)
-    }
-
-    fn cfg() -> LinkConfig {
-        LinkConfig {
-            latency: Duration::from_millis(10),
-            bandwidth_bps: 8_000, // 1 KB/s -> 1ms per byte
-            queue_capacity_bytes: 1000,
-        }
-    }
 
     #[test]
     fn serialization_delay_is_correct() {
@@ -141,60 +138,36 @@ mod tests {
     }
 
     #[test]
-    fn link_propagation_and_serialization() {
-        let mut link = Link::new(
-            LinkId::new(0),
-            cfg(),
-            NodeId::new(0),
-            PortId::new(0),
-            NodeId::new(1),
-            PortId::new(0),
-        );
-
-        // 1 byte, bandwidth 8000 bps -> 1ms serialization, 10ms latency.
-        let (ser_done, arrive) = link.enqueue(Duration::ZERO, pkt(1, 1)).unwrap();
-        assert_eq!(ser_done, Duration::from_millis(1));
-        assert_eq!(arrive, Duration::from_millis(11));
-    }
-
-    #[test]
-    fn drop_tail_overflow() {
-        let small_cfg = LinkConfig {
-            latency: Duration::ZERO,
-            bandwidth_bps: 8_000_000_000,
-            queue_capacity_bytes: 100,
+    fn transmit_times_add_serialization_then_latency() {
+        let c = LinkConfig {
+            latency: Duration::from_millis(10),
+            bandwidth_bps: 8_000, // 1 KB/s -> 1ms per byte
+            queue_capacity_bytes: 1000,
         };
-        let mut link = Link::new(
-            LinkId::new(0),
-            small_cfg,
-            NodeId::new(0),
-            PortId::new(0),
-            NodeId::new(1),
-            PortId::new(0),
-        );
-
-        assert!(link.enqueue(Duration::ZERO, pkt(1, 60)).is_some());
-        assert!(link.enqueue(Duration::ZERO, pkt(2, 30)).is_some());
-        // 60 + 30 + 30 > 100 -> dropped
-        assert!(link.enqueue(Duration::ZERO, pkt(3, 30)).is_none());
-        assert_eq!(link.packets_dropped, 1);
+        let (ser_done, arrive) = c.transmit_times(Duration::from_millis(5), 1);
+        assert_eq!(ser_done, Duration::from_millis(6));
+        assert_eq!(arrive, Duration::from_millis(16));
     }
 
     #[test]
-    fn deterministic_packet_ordering() {
-        let mut link = Link::new(
+    fn ends_are_resolved_per_direction() {
+        let link = Link::new(
             LinkId::new(0),
-            cfg(),
-            NodeId::new(0),
-            PortId::new(0),
-            NodeId::new(1),
-            PortId::new(0),
+            LinkConfig {
+                latency: Duration::ZERO,
+                bandwidth_bps: 1,
+                queue_capacity_bytes: 1,
+            },
+            NodeId::new(10),
+            PortId::new(1),
+            NodeId::new(20),
+            PortId::new(2),
         );
-
-        // Two packets back-to-back: second waits for the first to finish serializing.
-        let (s1, a1) = link.enqueue(Duration::ZERO, pkt(1, 1)).unwrap();
-        let (s2, a2) = link.enqueue(Duration::ZERO, pkt(2, 1)).unwrap();
-        assert!(s1 < s2);
-        assert!(a1 < a2);
+        assert!(link.is_src(NodeId::new(10)));
+        assert!(!link.is_src(NodeId::new(20)));
+        assert_eq!(link.far_end(true), (NodeId::new(20), PortId::new(2)));
+        assert_eq!(link.far_end(false), (NodeId::new(10), PortId::new(1)));
+        assert_eq!(link.near_end(true), (NodeId::new(10), PortId::new(1)));
+        assert_eq!(link.near_end(false), (NodeId::new(20), PortId::new(2)));
     }
 }

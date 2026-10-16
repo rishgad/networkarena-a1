@@ -282,6 +282,8 @@ impl TinyVmState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
+    /// The program has more stages than a switch's pipeline.
+    TooManyStages { stages: usize, max: usize },
     LoopDetected { stage: usize },
     TooManyInstructions { stage: usize },
     TooManyAluOps { stage: usize },
@@ -293,8 +295,14 @@ pub enum ValidationError {
     MultipleMemoryResources { stage: usize },
 }
 
+/// How many stages a program may have. A switch's pipeline is a fixed
+/// piece of hardware; a program that wants more work per packet
+/// recirculates, it does not grow the pipeline.
+pub const MAX_STAGES: usize = 8;
+
 #[derive(Debug, Clone)]
 pub struct ValidatorLimits {
+    pub max_stages: usize,
     pub max_instrs_per_stage: usize,
     pub max_memory_resources_per_stage: u8,
 }
@@ -302,6 +310,7 @@ pub struct ValidatorLimits {
 impl Default for ValidatorLimits {
     fn default() -> Self {
         Self {
+            max_stages: MAX_STAGES,
             max_instrs_per_stage: 64,
             max_memory_resources_per_stage: 1,
         }
@@ -322,6 +331,12 @@ pub fn validate(
     state: &TinyVmState,
     limits: &ValidatorLimits,
 ) -> Result<(), ValidationError> {
+    if program.stages.len() > limits.max_stages {
+        return Err(ValidationError::TooManyStages {
+            stages: program.stages.len(),
+            max: limits.max_stages,
+        });
+    }
     for (stage_idx, stage) in program.stages.iter().enumerate() {
         if stage.instrs.len() > limits.max_instrs_per_stage {
             return Err(ValidationError::TooManyInstructions { stage: stage_idx });

@@ -7,7 +7,8 @@ A `Switch` is the union of:
 3. A **CPU-style controller** (anything implementing `SwitchController`).
 4. A **punt pipe** carrying punted packets up to the controller.
 5. A **config pipe** carrying controller actions back down.
-6. **Egress queues**, one per port (drop-tail FIFO).
+6. **Egress ports**, one per port, each holding one or more queues and a
+   scheduler (see [Queues](#6-queues) below).
 
 Building a switch means filling in each of those.
 
@@ -88,8 +89,22 @@ pub trait SwitchController {
     fn on_punt(&mut self, event: PuntEvent) -> Vec<ControllerAction>;
     fn on_timer(&mut self, now: SimTime) -> Vec<ControllerAction>;
     fn on_link_event(&mut self, event: LinkEvent) -> Vec<ControllerAction>;
+    // Provided: the timer with what each port dropped since the last one.
+    // The simulator calls this; the default delegates to `on_timer`.
+    fn on_timer_with_drops(&mut self, now: SimTime, drops: Vec<PortDrops>) -> Vec<ControllerAction>;
 }
 ```
+
+`PortDrops { port, dropped, policy, queues }` lists every port that
+refused a packet since the controller's previous timer: `dropped` counts
+every refusal (pool full, queue full, drop threshold), `policy` the ones
+the queue's drop threshold caused while there was still room, and
+`queues` splits `dropped` by the queue the packet was headed for. A port
+that dropped nothing is not listed. This is the one piece of data-plane
+state a controller is told about without asking; everything else it must
+infer from punts. At start, a wasm program is also told the capacity of
+the link on each of its ports (`InitInputW.port_capacity_bps`, parallel
+to `local_ports`), and nothing about who is on the other end.
 
 Controllers receive events and return actions. They never touch tables or
 queues directly — every effect goes through:
@@ -98,18 +113,26 @@ queues directly — every effect goes through:
 pub enum ControllerAction {
     InstallTableEntry { table_id, entry },
     DeleteTableEntry  { table_id, entry_id },
-    InjectPacket      { packet, port },
+    InjectPacket      { packet, port, queue },
     SetQueueConfig    { port, config },
+    ScheduleTimer     { delay },
+    DeclareLink       { port, up },
 }
 ```
+
+`DeclareLink` changes nothing in the data plane. It puts on record what
+the controller believes about the link on one of its ports, and the
+simulator logs it (`LinkDeclared`) at the moment it lands, so a grader
+can hold belief against the truth. The SDK spells it `link_down(port)`
+and `link_up(port)`.
 
 Each returned action travels through the **config pipe** before it lands on
 the data plane. So if the controller installs a route in response to a
 punt, the install does not take effect until
 `config_pipe_latency + serialization_delay(action_size)` after the
-controller emits it. `InjectPacket` is the same — the simulator schedules
-the packet onto the appropriate egress link at the config-pipe arrival
-time.
+controller emits it. `InjectPacket` is the same — the simulator places
+the packet in queue `queue` of the named egress port at the config-pipe
+arrival time.
 
 A `NoopController` is provided for tests where the data plane is the only
 thing under examination.
@@ -150,12 +173,14 @@ loads a `wasm` module exporting:
 ```text
 init(config_ptr, config_len) -> i32
 on_punt(event_ptr, event_len, out_ptr, out_cap) -> i32
-on_timer(now_lo, now_hi, out_ptr, out_cap) -> i32
+on_timer(event_ptr, event_len, out_ptr, out_cap) -> i32
 on_link_event(event_ptr, event_len, out_ptr, out_cap) -> i32
 ```
 
 Inputs and outputs are postcard-encoded over a shared linear-memory
-buffer. The host meters fuel (`WasmLimits.fuel_per_call`), catches traps,
+buffer. The timer's input is `TimerEventW { now_ns, port_drops }`, the
+drops being the same per-port deltas `on_timer_with_drops` gets; `init`'s
+is `InitInputW { switch_id, local_ports, port_capacity_bps }`. The host meters fuel (`WasmLimits.fuel_per_call`), catches traps,
 bounds output size (`max_output_bytes`), and treats trap / fuel-exhaustion
 / decode errors as controller failure (the controller stops receiving
 events; the data plane keeps forwarding).
@@ -184,6 +209,60 @@ let switch = Switch::new(
 sim.add_switch(switch);
 ```
 
-`num_ports` sizes the egress-queue array; ports beyond it are unreachable.
-`per_port_queue_bytes` is the initial drop-tail capacity per port —
-controllers can resize it later via `SetQueueConfig`.
+`num_ports` sizes the egress-port array; ports beyond it are unreachable.
+`per_port_queue_bytes` is the initial drop-tail capacity of each port's
+single queue — controllers reshape it later via `SetQueueConfig`. The
+switch also has a shared buffer pool (`buffer_budget`, default
+`per_port_queue_bytes × num_ports`, i.e. not binding) that every port
+draws from; a packet needs room in both to be admitted.
+`with_packet_size_bytes` and `with_buffer_budget_packets` set the pool
+the way a world does: in packets of the world's data size.
+
+## 6. Queues
+
+Every egress port starts as one drop-tail FIFO. A controller gives it
+more with
+
+```rust
+ControllerAction::SetQueueConfig {
+    port,
+    config: QueueConfig {
+        discipline: Discipline::StrictPriority,          // or Fifo, Drr
+        queues: vec![QueueSpec::new(8), QueueSpec::new(64)],
+    },
+}
+```
+
+Everything in a `QueueSpec` is counted in **packets**; the switch
+multiplies by its `packet_size_bytes` (the world's data packet size) to
+get byte caps. Queue `i` of the list is what the data plane's
+`SetQueue { queue: i }` — the `queue i` instruction or a table's
+`SetQueue` action — selects; a queue id past the end lands in the last
+queue. Packets already waiting when the config lands are carried over,
+never evicted.
+
+Disciplines:
+
+- `Fifo` — serve in arrival order (with several queues, identical to
+  strict priority; use it for the one-queue case).
+- `StrictPriority` — queue 0 whenever it has a packet, else queue 1, and
+  so on. Lower queues can starve higher ones.
+- `Drr` — deficit round robin. Each round, queue `i` earns
+  `weight_i` packets' worth of credit and sends heads while the credit
+  covers them; an empty queue forfeits its credit. Two queues with
+  weights 1 and 3 share a saturated wire 1:3.
+
+Injected packets join queue 0 unless `InjectPacket { queue }` says
+otherwise, so a controller's own HELLOs can ride a priority queue across
+a port its data traffic has saturated.
+
+### Dropping early
+
+`QueueSpec::drop_threshold_packets` draws a line below the cap. An
+arrival that would take the queue past the line is refused even though
+there is room for it, and the drop is logged as `Policy` — the program's
+choice — rather than `QueueFull`. The queue's occupancy never exceeds the
+line, so the line also bounds the queueing delay a packet admitted to
+that queue will see. A thresholded queue reopens as soon as a departure
+takes it back under the line. `EgressPort::policy_dropped` counts these
+separately from full-queue drops.

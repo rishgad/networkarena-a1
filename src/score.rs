@@ -263,9 +263,11 @@ fn drop_name(r: &DropReasonW) -> &'static str {
         DropReasonW::Ttl => "ttl expired",
         DropReasonW::NoRoute => "no route",
         DropReasonW::NoEgressLink => "no egress link",
-        DropReasonW::LinkDrop => "link down or queue full",
+        DropReasonW::LinkDrop => "link down",
         DropReasonW::SwitchFailed => "switch failed",
         DropReasonW::Recirculation => "recirculation limit",
+        DropReasonW::QueueFull => "queue full",
+        DropReasonW::Policy => "dropped by program",
     }
 }
 
@@ -621,7 +623,12 @@ pub fn score_file(
             "{misdelivered} packets reached an app that does not own the destination address"
         ));
     }
-    let crate::world::Workload::AllPairsCbr { interval_ms, .. } = world.workload;
+    // Only an open-loop workload has a predictable packet count; a
+    // closed-loop one sends what the network lets it.
+    let interval_ms = match world.workload {
+        crate::world::Workload::AllPairsCbr { interval_ms, .. } => interval_ms,
+        crate::world::Workload::Mixed { .. } => 0,
+    };
     if interval_ms > 0 && hi > lo {
         let expected = world.apps.len() as f64 * (hi - lo) as f64 / interval_ms as f64;
         if expected > 0.0 {
@@ -673,7 +680,15 @@ pub fn score_file(
         links: world.links.len(),
         apps: world.apps.len(),
         diameter: world.world.diameter,
-        schedule: schedule.map(|s| format!("{} seed {}", s.schedule.world, s.schedule.seed)),
+        // The seed is not printed: the hidden schedules are cut from it.
+        schedule: schedule.map(|s| {
+            format!(
+                "{}, {} link event{}",
+                s.schedule.world,
+                s.failures.len(),
+                if s.failures.len() == 1 { "" } else { "s" }
+            )
+        }),
         program,
         run_ms,
         window_ms: (lo, hi),
@@ -1058,6 +1073,8 @@ size_bytes = 100
             ip_ttl: 64,
             label_top: 0,
             label_depth: 0,
+            flow_id: src as u64,
+            seq: None,
         }
     }
 
@@ -1475,6 +1492,8 @@ size_bytes = 100
                         ip_ttl: 1,
                         label_top: 0,
                         label_depth: 0,
+                        flow_id: 0,
+                        seq: None,
                     },
                 },
             );

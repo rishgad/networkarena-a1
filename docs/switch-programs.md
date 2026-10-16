@@ -71,6 +71,10 @@ pub struct MyProgram {
 }
 
 impl SwitchProgram for MyProgram {
+    // `local_ports` are the ports with a link; who is on the other end
+    // you learn yourself. Override `init_with(input: InitInput)` instead
+    // when you also want `input.port_capacity_bps`, each port's link
+    // speed in bits per second, in the same order.
     fn init(switch_id: u32, local_ports: Vec<u16>) -> (Self, ProgramSetup) {
         let mut setup = ProgramSetup::new();
 
@@ -95,7 +99,16 @@ impl SwitchProgram for MyProgram {
         vec![actions::install_route(1, 42, ev.ip_dst as u64, 32, 1)]
     }
 
-    fn on_timer(&mut self, _ev: TimerEvent) -> Vec<Action> {
+    fn on_timer(&mut self, ev: TimerEvent) -> Vec<Action> {
+        // `ev.now_ns` is the time; `ev.port_drops` lists every port that
+        // refused a packet since the previous timer, with how many it
+        // refused (`dropped`), how many of those were its own drop
+        // threshold at work (`policy`), and the split by queue
+        // (`queues`, indexed like the port's `set_queues` list). Ports
+        // that dropped nothing are absent.
+        for d in &ev.port_drops {
+            let _ = (d.port, d.dropped, d.policy, &d.queues);
+        }
         // The first timer is scheduled by the host; subsequent timers
         // must be re-armed by the program itself:
         vec![actions::schedule_timer(50_000_000)]   // 50 ms
@@ -412,9 +425,9 @@ returns the number of bytes written, or a negative value on error.
 
 | Export          | Input          | Output                    |
 |-----------------|----------------|---------------------------|
-| `init`          | `InitInputW`   | `ProgramSetupW`           |
+| `init`          | `InitInputW` (`switch_id`, `local_ports`, `port_capacity_bps`) | `ProgramSetupW` |
 | `on_punt`       | `PuntEventW`   | `Vec<ActionW>`            |
-| `on_timer`      | `TimerEventW`  | `Vec<ActionW>`            |
+| `on_timer`      | `TimerEventW` (`now_ns`, `port_drops: Vec<PortDropsW>`) | `Vec<ActionW>` |
 | `on_link_event` | `LinkEventW`   | `Vec<ActionW>`            |
 
 The wire types are defined in `switch_program_types/src/lib.rs`. Postcard

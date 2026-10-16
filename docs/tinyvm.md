@@ -35,8 +35,10 @@ pub struct TinyProgram {
 }
 ```
 
-Within a stage, registers (`Reg`) are scratch space — they reset between
-stages. Metadata (`MetaKey`) is per-packet and persists across stages and
+A program has at most **8** stages (`tinyvm::MAX_STAGES`); the loader
+refuses a longer one. Within a stage, registers (`Reg`) are scratch space —
+they reset between stages, so every stage loads the fields it reads.
+Metadata (`MetaKey`) is per-packet and persists across stages and
 recirculations.
 
 ## Instruction set

@@ -14,6 +14,15 @@ impl Node {
             Node::App(a) => NodeId::new(a.raw()),
         }
     }
+
+    /// Inverse of [`as_node_id`](Self::as_node_id).
+    pub fn from_node_id(id: NodeId) -> Node {
+        if (id.raw() & 0x8000_0000) != 0 {
+            Node::Switch(SwitchId::new(id.raw() & 0x7fff_ffff))
+        } else {
+            Node::App(AppId::new(id.raw()))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

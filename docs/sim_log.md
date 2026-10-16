@@ -45,8 +45,11 @@ The hot-path cost when logging is **not** enabled is one
 ...
 ```
 
-The first frame is always `LogEvent::Header { magic: 0x4E45_534D, version: 1 }`.
-Subsequent frames are ordered by simulator time.
+The first frame is always `LogEvent::Header { magic: 0x4E45_534D, version: 3 }`.
+Subsequent frames are ordered by simulator time. Version 2 appended the
+`QueueFull` / `Policy` drop reasons and the queue and declaration events;
+version 3 added `flow_id` and `seq` to `PacketSnapshot`, which a reader
+built for version 3 needs, so version 1 and 2 logs no longer decode.
 
 `LogFrame { at_ns: u64, event: LogEvent }` and the `LogEvent` enum live
 in [`src/sim_log/schema.rs`](../src/sim_log/schema.rs). Events:
@@ -62,14 +65,24 @@ in [`src/sim_log/schema.rs`](../src/sim_log/schema.rs). Events:
 | `SwitchFailed`         | `Simulator::fail_switch`                                    |
 | `CpuFailed`            | `Simulator::fail_cpu`                                       |
 | `PacketIngress`        | every switch ingress, after trail stamping                  |
-| `PacketEgress`         | every successful link enqueue out of a switch                |
-| `PacketDropped`        | every drop, with `DropReason`                                |
+| `PacketEgress`         | a packet starts onto the wire out of a switch port           |
+| `PacketDropped`        | every drop, with `DropReason` (see below)                    |
 | `PacketDelivered`      | when a packet reaches an app                                 |
 | `PacketPunted`         | when a packet hits the controller                            |
 | `ProgramInstalled`     | initial snapshot via `Simulator::install_program`            |
 | `TableEntryInstalled`  | controller action arrives via the config pipe                |
 | `TableEntryDeleted`    | ditto                                                        |
-| `QueueConfigChanged`   | controller `SetQueueConfig` arrives                          |
+| `PortQueuesConfigured` | controller `SetQueueConfig` arrives: discipline + queues in packets, and the byte size of one packet |
+| `LinkDeclared`         | controller `DeclareLink` arrives: what the switch now *believes* about the link on a port (`up`); compare with `LinkFailed/Restored`, the truth |
+| `QueueConfigChanged`   | pre-version-2 form of the above; no longer written           |
+
+`DropReason` says why a packet died: `Ttl`, `NoRoute` (punted with no
+route and the controller had none either), `NoEgressLink` (forwarded out
+a port with no cable), `LinkDrop` (the link was down), `SwitchFailed`,
+`Recirculation` (hit the recirculation limit), `QueueFull` (the egress
+queue or the switch's buffer pool had no room), and `Policy` (the switch
+program executed `drop`). Logs before version 2 reported a full queue as
+`LinkDrop` and a program drop as `NoRoute`.
 
 `PacketSnapshot` carries id / kind / size / ip / ttl / label-stack
 summary, but **not** the payload bytes — those would balloon the log

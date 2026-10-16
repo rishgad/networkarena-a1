@@ -49,9 +49,9 @@ pub use switch_program_types::text;
 
 // Friendly aliases for SDK users.
 pub use wire::{
-    ActionW as Action, CounterDeclW, InstrW as Instr, LinkEventW as LinkEvent,
+    ActionW as Action, CcaW as Cca, CounterDeclW, CustomerW as Customer, InitInputW as InitInput, InstrW as Instr, LinkEventW as LinkEvent,
     MatchKindW as MatchKind, PacketFieldW as PacketField, PuntEventW as PuntEvent,
-    PuntReasonW as PuntReason, RegisterDeclW, StageProgramW as StageProgram,
+    PortDropsW as PortDrops, PuntReasonW as PuntReason, QueueSpecW as QueueSpec, RegisterDeclW, StageProgramW as StageProgram,
     TableActionW as TableAction, TableEntryW as TableEntry, TimerEventW as TimerEvent,
     TinyProgramW as TinyProgram,
 };
@@ -200,7 +200,98 @@ pub mod actions {
     pub fn schedule_timer(delay_ns: u64) -> Action {
         Action::ScheduleTimer { delay_ns }
     }
+
+    /// Declare that the link on `port` is dead. This is a statement for
+    /// the record, compared against the truth in grading; it does not
+    /// change forwarding. Say it when your control plane concludes the
+    /// link is gone, and say `link_up` when it concludes otherwise.
+    pub fn link_down(port: u16) -> Action {
+        Action::DeclareLink {
+            port: wire::PortIdW(port),
+            up: false,
+        }
+    }
+
+    /// Declare that the link on `port` is alive (again). See `link_down`.
+    pub fn link_up(port: u16) -> Action {
+        Action::DeclareLink {
+            port: wire::PortIdW(port),
+            up: true,
+        }
+    }
+
+    /// Send an injected packet through queue `queue` of its port instead
+    /// of queue 0. Wrap `inject_packet` / `inject_bgp_packet`:
+    ///
+    /// ```ignore
+    /// actions::in_queue(0, actions::inject_bgp_packet(port, me, peer, 64, bytes))
+    /// ```
+    ///
+    /// Non-inject actions are returned unchanged.
+    pub fn in_queue(queue: u16, action: Action) -> Action {
+        match action {
+            Action::InjectPacket {
+                port,
+                ip_src,
+                ip_dst,
+                ip_proto,
+                ip_ttl,
+                kind,
+                size_bytes,
+                payload,
+            }
+            | Action::InjectPacketQueued {
+                port,
+                ip_src,
+                ip_dst,
+                ip_proto,
+                ip_ttl,
+                kind,
+                size_bytes,
+                payload,
+                ..
+            } => Action::InjectPacketQueued {
+                port,
+                queue: wire::QueueIdW(queue),
+                ip_src,
+                ip_dst,
+                ip_proto,
+                ip_ttl,
+                kind,
+                size_bytes,
+                payload,
+            },
+            other => other,
+        }
+    }
+
+    /// Give `port` the queues in `queues`, served by `discipline`. Queue
+    /// `i` here is what the data plane's `queue i` instruction (or a
+    /// table's `SetQueue`) selects. Sizes are in packets. Packets already
+    /// waiting on the port are kept.
+    pub fn set_queues(port: u16, discipline: Discipline, queues: Vec<QueueSpec>) -> Action {
+        Action::SetQueueConfig {
+            port: wire::PortIdW(port),
+            discipline: discipline as u8,
+            queues,
+        }
+    }
 }
+
+/// How an egress port serves its queues. See [`actions::set_queues`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Discipline {
+    /// Arrival order across all queues; with several queues this is the
+    /// same as `StrictPriority`.
+    Fifo = wire::DISCIPLINE_FIFO,
+    /// Queue 0 whenever it has a packet, else queue 1, and so on.
+    StrictPriority = wire::DISCIPLINE_STRICT_PRIORITY,
+    /// Deficit round robin: each queue gets `weight` packets of credit
+    /// per round.
+    Drr = wire::DISCIPLINE_DRR,
+}
+
 
 /// User-facing trait. Implement this for your switch program type, then call
 /// the [`switch_program!`] macro at module scope to wire up exports.
@@ -209,6 +300,18 @@ pub trait SwitchProgram: Sized + 'static {
     /// link attached on this switch — the program does not know who is on
     /// the other side of each port; it has to learn that.
     fn init(switch_id: u32, local_ports: Vec<u16>) -> (Self, ProgramSetup);
+
+    /// Construct the program from everything the host says at start:
+    /// the switch id, the ports with a link, each link's capacity in
+    /// bits per second (`input.port_capacity_bps`, parallel to
+    /// `input.local_ports`), and the customer contract
+    /// (`input.customers`: every customer's source prefix, its [`Cca`]
+    /// and the rate it asks for). The default forwards to `init`;
+    /// override this instead when the capacities or the contract matter
+    /// to you.
+    fn init_with(input: InitInput) -> (Self, ProgramSetup) {
+        Self::init(input.switch_id, input.local_ports)
+    }
 
     fn on_punt(&mut self, _event: PuntEvent) -> Vec<Action> {
         Vec::new()
@@ -279,10 +382,7 @@ macro_rules! switch_program {
                 out_ptr,
                 out_cap,
                 |input| {
-                    let (program, setup) = <$ty as $crate::SwitchProgram>::init(
-                        input.switch_id,
-                        input.local_ports,
-                    );
+                    let (program, setup) = <$ty as $crate::SwitchProgram>::init_with(input);
                     __SWITCH_PROGRAM_SLOT.with(|cell| *cell.borrow_mut() = Some(program));
                     setup.into_wire()
                 },

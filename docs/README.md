@@ -8,3 +8,4 @@ Guides included in this kit:
 - [programming-a-switch.md](programming-a-switch.md)
 - [building-a-network.md](building-a-network.md)
 - [sim_log.md](sim_log.md)
+- [a2-floors.md](a2-floors.md)

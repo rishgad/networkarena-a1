@@ -1,7 +1,10 @@
 pub mod app;
 pub mod controller;
+pub mod egress;
 pub mod event;
 pub mod failures;
+pub mod floors;
+pub mod flow;
 pub mod link;
 pub mod network;
 pub mod packet;
@@ -21,7 +24,9 @@ pub mod bgp;
 pub mod trace;
 
 pub use app::{App, AppMetrics, TrafficPattern};
-pub use controller::{ControllerAction, LinkEvent, PuntEvent, QueueConfig, SwitchController};
+pub use controller::{
+    ControllerAction, Discipline, LinkEvent, PuntEvent, QueueConfig, QueueSpec, SwitchController,
+};
 pub use event::{Event, EventKind, EventQueue};
 pub use link::{Link, LinkConfig};
 pub use network::Network;

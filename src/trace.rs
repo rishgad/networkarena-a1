@@ -17,9 +17,14 @@ pub enum DropReason {
     Ttl,
     NoRoute,
     NoEgressLink,
+    /// The link out of the chosen port is down.
     LinkDrop,
     SwitchFailed,
     Recirculation,
+    /// The egress queue (or the node's buffer pool) had no room.
+    QueueFull,
+    /// The data-plane program chose to drop the packet.
+    Policy,
 }
 
 #[derive(Debug, Clone)]

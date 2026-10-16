@@ -26,15 +26,12 @@ pub enum EventKind {
         packet: Packet,
     },
 
-    /// Egress port finished serializing the head packet.
+    /// The packet has fully left the sending port onto the wire. `from_src`
+    /// names the direction: true for the link's src→dst half. The handler
+    /// schedules the far-end arrival and pulls the port's next packet.
     LinkSerializationDone {
         link: LinkId,
-        packet: Packet,
-    },
-
-    /// Packet propagation finished — arrives at far side of link.
-    LinkArrive {
-        link: LinkId,
+        from_src: bool,
         packet: Packet,
     },
 

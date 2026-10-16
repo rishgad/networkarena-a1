@@ -30,7 +30,7 @@
 //! Traps, fuel exhaustion, and decode failures have the same effect.
 
 use crate::controller::{
-    ControllerAction, LinkEvent, PuntEvent, QueueConfig, SwitchController,
+    ControllerAction, Discipline, LinkEvent, PortDrops, PuntEvent, QueueConfig, QueueSpec, SwitchController,
 };
 use crate::packet::{PacketField, PuntReason};
 use crate::tinyvm::{
@@ -60,6 +60,12 @@ pub struct WasmLimits {
     pub max_register_slots: u32,
     pub max_counter_arrays: usize,
     pub max_counter_slots: u32,
+    /// Ceiling on one instance's linear memory. Without it a module can
+    /// `memory.grow` toward wasm32's 4 GiB -- cheap enough in instructions
+    /// to fit inside the fuel budget -- across every switch in the world,
+    /// and take the host down. Fuel stops a program that runs forever; it
+    /// does nothing about one that asks for everything in a single step.
+    pub max_memory_bytes: usize,
 }
 
 impl Default for WasmLimits {
@@ -82,7 +88,59 @@ impl Default for WasmLimits {
             max_register_slots: 4096,
             max_counter_arrays: 16,
             max_counter_slots: 4096,
+            // A link-state solution on a 15-switch world holds an adjacency
+            // graph, tables already bounded above at 16 x 1024 entries, and
+            // some buffers -- kilobytes to low megabytes; the whole reference
+            // *module* is 116 KB. So this is ~1000x headroom over honest use,
+            // while 15 instances at the ceiling still cap a run near 2 GB.
+            // Reaching it means a runaway allocation, not a design choice.
+            max_memory_bytes: 128 * 1024 * 1024,
         }
+    }
+}
+
+/// Per-instance store state: enforces [`WasmLimits::max_memory_bytes`] and
+/// records what was actually used.
+///
+/// A denied growth does **not** trap on its own -- wasm's `memory.grow`
+/// simply returns -1, and it is the guest allocator that panics a moment
+/// later. That panic arrives here as an ordinary trap, indistinguishable
+/// from a divide by zero. So the denial is remembered, and [`call_export`]
+/// consults it to name the cause instead of reporting a mystery.
+pub struct HostState {
+    max_memory_bytes: usize,
+    /// Set when a growth was refused, so the resulting trap can be named.
+    memory_denied: bool,
+    /// High-water mark of linear memory actually granted, in bytes.
+    peak_memory_bytes: usize,
+}
+
+impl wasmtime::ResourceLimiter for HostState {
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        if desired > self.max_memory_bytes {
+            self.memory_denied = true;
+            return Ok(false);
+        }
+        self.peak_memory_bytes = self.peak_memory_bytes.max(desired);
+        Ok(true)
+    }
+
+    /// Tables here are wasm function tables, not the data-plane tables
+    /// `init` declares -- those are capped separately and far lower. A
+    /// module's function table is bounded by its own type section, so the
+    /// memory ceiling is the one that matters.
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        _desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        Ok(true)
     }
 }
 
@@ -107,6 +165,11 @@ pub enum WasmError {
     /// `init` declared more state than the limits allow. Carries a message
     /// naming what was over and by how much.
     DeclarationTooLarge(String),
+    /// The program declared more TinyVM stages than a pipeline has.
+    TooManyStages(usize),
+    /// The program tried to grow its linear memory past the ceiling.
+    /// Carries the ceiling, in bytes.
+    MemoryLimit(usize),
 }
 
 impl core::fmt::Display for WasmError {
@@ -123,6 +186,16 @@ impl core::fmt::Display for WasmError {
             WasmError::InputTooLarge => write!(f, "wasm input too large"),
             WasmError::Memory(s) => write!(f, "memory error: {s}"),
             WasmError::DeclarationTooLarge(s) => write!(f, "declaration too large -- {s}"),
+            WasmError::TooManyStages(n) => write!(
+                f,
+                "the program has {n} TinyVM stages; a pipeline has at most {} -- recirculate instead",
+                crate::tinyvm::MAX_STAGES
+            ),
+            WasmError::MemoryLimit(cap) => write!(
+                f,
+                "grew past the {} MiB linear-memory ceiling",
+                cap / (1024 * 1024)
+            ),
         }
     }
 }
@@ -208,7 +281,7 @@ impl core::fmt::Display for ProgramFailure {
 
 /// Per-switch WASM controller state. Implements [`SwitchController`].
 pub struct WasmController {
-    store: Store<()>,
+    store: Store<HostState>,
     memory: Memory,
     on_punt: TypedFunc<(u32, u32, u32, u32), i32>,
     on_timer: TypedFunc<(u32, u32, u32, u32), i32>,
@@ -230,6 +303,8 @@ pub fn load_program(
     module_bytes: &[u8],
     switch_id: u32,
     local_ports: Vec<u16>,
+    port_capacity_bps: Vec<u64>,
+    customers: Vec<wire::CustomerW>,
     limits: WasmLimits,
 ) -> Result<LoadedProgram, WasmError> {
     let mut config = wasmtime::Config::new();
@@ -237,11 +312,19 @@ pub fn load_program(
     let engine = Engine::new(&config).map_err(|e| WasmError::Compile(e.to_string()))?;
     let module = Module::new(&engine, module_bytes)
         .map_err(|e| WasmError::Compile(e.to_string()))?;
-    let mut store = Store::new(&engine, ());
+    let mut store = Store::new(
+        &engine,
+        HostState {
+            max_memory_bytes: limits.max_memory_bytes,
+            memory_denied: false,
+            peak_memory_bytes: 0,
+        },
+    );
+    store.limiter(|s| s);
     store
         .set_fuel(limits.fuel_per_call)
         .map_err(|e| WasmError::Compile(e.to_string()))?;
-    let linker: Linker<()> = Linker::new(&engine);
+    let linker: Linker<HostState> = Linker::new(&engine);
     let instance = linker
         .instantiate(&mut store, &module)
         .map_err(|e| WasmError::Instantiate(e.to_string()))?;
@@ -263,7 +346,12 @@ pub fn load_program(
         .map_err(|_| WasmError::MissingExport("on_link_event".into()))?;
 
     // Drive `init`.
-    let init_input = postcard::to_allocvec(&wire::InitInputW { switch_id, local_ports })
+    let init_input = postcard::to_allocvec(&wire::InitInputW {
+        switch_id,
+        local_ports,
+        port_capacity_bps,
+        customers,
+    })
         .map_err(|e| WasmError::DecodeError(e.to_string()))?;
     let setup_bytes = call_export(
         &mut store,
@@ -277,6 +365,9 @@ pub fn load_program(
         .map_err(|e| WasmError::DecodeError(e.to_string()))?;
 
     let state = state_from_wire(&setup, &limits)?;
+    if setup.program.stages.len() > crate::tinyvm::MAX_STAGES {
+        return Err(WasmError::TooManyStages(setup.program.stages.len()));
+    }
     let program = tiny_program_from_wire(setup.program);
 
     let controller = WasmController {
@@ -298,7 +389,7 @@ pub fn load_program(
 /// Generic export caller: writes input into wasm memory, calls the function,
 /// reads the returned bytes from the output buffer.
 fn call_export(
-    store: &mut Store<()>,
+    store: &mut Store<HostState>,
     memory: &Memory,
     func: &TypedFunc<(u32, u32, u32, u32), i32>,
     input: &[u8],
@@ -327,6 +418,11 @@ fn call_export(
             // out is the whole point: "your loop never ends" and "you
             // divided by zero" are different bugs and deserve different
             // words.
+            // A refused memory growth surfaces here as the guest
+            // allocator's panic, so check that before reading the trap.
+            if store.data().memory_denied {
+                return Err(WasmError::MemoryLimit(limits.max_memory_bytes));
+            }
             return Err(match e.downcast_ref::<Trap>() {
                 Some(Trap::OutOfFuel) => WasmError::OutOfFuel,
                 Some(t) => WasmError::Trap(t.to_string()),
@@ -383,6 +479,18 @@ impl WasmController {
             ),
             WasmError::DecodeError(m) => format!(
                 "returned bytes that are not a valid action list ({m})."
+            ),
+            // Worth more words than the others: the A1 kit shipped before
+            // this ceiling existed, so this is the one failure a student
+            // cannot reproduce at home.
+            WasmError::MemoryLimit(bytes) => format!(
+                "grew its linear memory past the {} MiB ceiling. That ceiling \
+                 is only here to stop one runaway allocation taking the grader \
+                 down -- it is hundreds of times more memory than a working \
+                 solution needs, so the cause is almost always state that grows \
+                 on every event and is never bounded: a record of every packet \
+                 seen, or a map keyed by something that keeps changing.",
+                bytes / (1024 * 1024)
             ),
             other => format!("{other}"),
         }
@@ -466,8 +574,21 @@ impl SwitchController for WasmController {
     }
 
     fn on_timer(&mut self, now: SimTime) -> Vec<ControllerAction> {
+        self.on_timer_with_drops(now, Vec::new())
+    }
+
+    fn on_timer_with_drops(&mut self, now: SimTime, drops: Vec<PortDrops>) -> Vec<ControllerAction> {
         let bytes = postcard::to_allocvec(&wire::TimerEventW {
             now_ns: now.as_nanos() as u64,
+            port_drops: drops
+                .into_iter()
+                .map(|d| wire::PortDropsW {
+                    port: d.port.raw(),
+                    dropped: d.dropped.min(u32::MAX as u64) as u32,
+                    policy: d.policy.min(u32::MAX as u64) as u32,
+                    queues: d.queues.iter().map(|q| (*q).min(u32::MAX as u64) as u32).collect(),
+                })
+                .collect(),
         })
         .expect("postcard encode");
         self.now_ns = now.as_nanos() as u64;
@@ -748,12 +869,25 @@ fn action_from_wire(a: wire::ActionW) -> Option<ControllerAction> {
                 entry_id: EntryId::new(entry_id.0),
             })
         }
-        wire::ActionW::SetQueueConfig { port, capacity_bytes } => {
-            Some(ControllerAction::SetQueueConfig {
-                port: PortId::new(port.0),
-                config: QueueConfig { capacity_bytes },
-            })
-        }
+        wire::ActionW::SetQueueConfig {
+            port,
+            discipline,
+            queues,
+        } => Some(ControllerAction::SetQueueConfig {
+            port: PortId::new(port.0),
+            config: QueueConfig {
+                discipline: Discipline::from_u8(discipline),
+                queues: queues
+                    .iter()
+                    .map(|q| QueueSpec {
+                        max_packets: q.max_packets,
+                        weight: q.weight.max(1),
+                        drop_threshold_packets: (q.drop_threshold_packets > 0)
+                            .then_some(q.drop_threshold_packets),
+                    })
+                    .collect(),
+            },
+        }),
         wire::ActionW::InjectPacket {
             port,
             ip_src,
@@ -763,23 +897,59 @@ fn action_from_wire(a: wire::ActionW) -> Option<ControllerAction> {
             kind,
             size_bytes,
             payload,
-        } => {
-            let mut p = crate::packet::Packet::new(
-                crate::types::PacketId::new(0),
-                core::time::Duration::ZERO,
-                size_bytes,
-            );
-            p.ip_src = crate::packet::IpAddr(ip_src);
-            p.ip_dst = crate::packet::IpAddr(ip_dst);
-            p.ip_proto = ip_proto;
-            p.ip_ttl = ip_ttl;
-            p.kind = crate::packet::PacketKind::from_u8(kind);
-            p.payload = payload;
-            Some(ControllerAction::InjectPacket { packet: p, port: PortId::new(port.0) })
-        }
+        } => Some(inject_from_wire(
+            port, 0, ip_src, ip_dst, ip_proto, ip_ttl, kind, size_bytes, payload,
+        )),
+        wire::ActionW::InjectPacketQueued {
+            port,
+            queue,
+            ip_src,
+            ip_dst,
+            ip_proto,
+            ip_ttl,
+            kind,
+            size_bytes,
+            payload,
+        } => Some(inject_from_wire(
+            port, queue.0, ip_src, ip_dst, ip_proto, ip_ttl, kind, size_bytes, payload,
+        )),
         wire::ActionW::ScheduleTimer { delay_ns } => Some(ControllerAction::ScheduleTimer {
             delay: core::time::Duration::from_nanos(delay_ns),
         }),
+        wire::ActionW::DeclareLink { port, up } => Some(ControllerAction::DeclareLink {
+            port: PortId::new(port.0),
+            up,
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inject_from_wire(
+    port: wire::PortIdW,
+    queue: u16,
+    ip_src: u32,
+    ip_dst: u32,
+    ip_proto: u8,
+    ip_ttl: u8,
+    kind: u8,
+    size_bytes: u64,
+    payload: Vec<u8>,
+) -> ControllerAction {
+    let mut p = crate::packet::Packet::new(
+        crate::types::PacketId::new(0),
+        core::time::Duration::ZERO,
+        size_bytes,
+    );
+    p.ip_src = crate::packet::IpAddr(ip_src);
+    p.ip_dst = crate::packet::IpAddr(ip_dst);
+    p.ip_proto = ip_proto;
+    p.ip_ttl = ip_ttl;
+    p.kind = crate::packet::PacketKind::from_u8(kind);
+    p.payload = payload;
+    ControllerAction::InjectPacket {
+        packet: p,
+        port: PortId::new(port.0),
+        queue: crate::types::QueueId::new(queue),
     }
 }
 
@@ -894,12 +1064,35 @@ mod tests {
     }
 
     #[test]
+    fn a_program_with_too_many_stages_is_refused_at_load() {
+        let mut setup = sample_setup();
+        let stage = setup.program.stages[0].clone();
+        setup.program.stages = vec![stage; crate::tinyvm::MAX_STAGES + 1];
+        let setup_bytes = postcard::to_allocvec(&setup).unwrap();
+        let punt_bytes = postcard::to_allocvec(&sample_punt_actions()).unwrap();
+        let wat = build_wat(&setup_bytes, &punt_bytes);
+        let err = load_program(wat.as_bytes(), 7, vec![], vec![], vec![], WasmLimits::default())
+            .err()
+            .expect("nine stages must be refused");
+        assert!(matches!(err, WasmError::TooManyStages(9)), "{err}");
+        assert!(err.to_string().contains("recirculate"));
+
+        // Exactly the limit is fine.
+        let mut setup = sample_setup();
+        let stage = setup.program.stages[0].clone();
+        setup.program.stages = vec![stage; crate::tinyvm::MAX_STAGES];
+        let setup_bytes = postcard::to_allocvec(&setup).unwrap();
+        let wat = build_wat(&setup_bytes, &punt_bytes);
+        assert!(load_program(wat.as_bytes(), 7, vec![], vec![], vec![], WasmLimits::default()).is_ok());
+    }
+
+    #[test]
     fn load_program_returns_setup_and_controller() {
         let setup_bytes = postcard::to_allocvec(&sample_setup()).unwrap();
         let punt_bytes = postcard::to_allocvec(&sample_punt_actions()).unwrap();
         let wat = build_wat(&setup_bytes, &punt_bytes);
 
-        let mut loaded = load_program(wat.as_bytes(), 7, vec![], WasmLimits::default()).unwrap();
+        let mut loaded = load_program(wat.as_bytes(), 7, vec![], vec![], vec![], WasmLimits::default()).unwrap();
         assert_eq!(loaded.program.stages.len(), 1);
         assert_eq!(loaded.state.tables.len(), 1);
 
@@ -947,7 +1140,7 @@ mod tests {
                 (i32.const 0)))
             "#
         );
-        let mut loaded = load_program(wat.as_bytes(), 0, vec![], WasmLimits::default()).unwrap();
+        let mut loaded = load_program(wat.as_bytes(), 0, vec![], vec![], vec![], WasmLimits::default()).unwrap();
         let event = PuntEvent {
             now: std::time::Duration::ZERO,
             switch: crate::types::SwitchId::new(0),
@@ -967,6 +1160,66 @@ mod tests {
         assert!(
             f.cause.contains("trapped"),
             "a genuine trap must not be reported as fuel exhaustion: {}",
+            f.cause
+        );
+    }
+
+    #[test]
+    fn growing_past_the_memory_ceiling_is_named_not_a_mystery_trap() {
+        let setup_bytes = postcard::to_allocvec(&sample_setup()).unwrap();
+        let setup_hex: String = setup_bytes.iter().map(|b| format!("\\{:02x}", b)).collect();
+        let setup_len = setup_bytes.len();
+        // Grow 16 pages at a time until `memory.grow` answers -1, then do
+        // what a guest allocator does when it cannot get memory: panic.
+        // That panic is an ordinary trap, which is exactly why the denial
+        // has to be remembered rather than read off the trap.
+        let wat = format!(
+            r#"
+            (module
+              (memory (export "memory") 1)
+              (data (i32.const 16384) "{setup_hex}")
+              (func (export "init") (param i32 i32 i32 i32) (result i32)
+                (memory.copy (local.get 2) (i32.const 16384) (i32.const {setup_len}))
+                (i32.const {setup_len}))
+              (func (export "on_punt") (param i32 i32 i32 i32) (result i32)
+                (loop $g
+                  (br_if $g (i32.ne (memory.grow (i32.const 16)) (i32.const -1))))
+                (unreachable))
+              (func (export "on_timer") (param i32 i32 i32 i32) (result i32)
+                (i32.const 0))
+              (func (export "on_link_event") (param i32 i32 i32 i32) (result i32)
+                (i32.const 0)))
+            "#
+        );
+        let limits = WasmLimits {
+            max_memory_bytes: 4 * 1024 * 1024,
+            ..WasmLimits::default()
+        };
+        let mut loaded = load_program(wat.as_bytes(), 0, vec![], vec![], vec![], limits).unwrap();
+        let event = PuntEvent {
+            now: std::time::Duration::ZERO,
+            switch: crate::types::SwitchId::new(0),
+            ingress_port: PortId::new(0),
+            reason: PuntReason::NoRoute,
+            packet: crate::packet::Packet::new(
+                crate::types::PacketId::new(0),
+                std::time::Duration::ZERO,
+                100,
+            ),
+        };
+        let actions = loaded.controller.on_punt(event);
+        assert!(actions.is_empty());
+        assert!(loaded.controller.failed, "the run must stop, not limp on");
+        let f = loaded.controller.failure.as_ref().expect("failure recorded");
+        assert!(
+            f.cause.contains("linear memory") && f.cause.contains("4 MiB"),
+            "a denied growth must be named and carry the ceiling, not read as a \
+             bare trap: {}",
+            f.cause
+        );
+        assert!(
+            !f.cause.contains("divide by zero"),
+            "must not be mistaken for a panic: {}",
             f.cause
         );
     }
@@ -997,7 +1250,7 @@ mod tests {
             fuel_per_call: 1000,
             ..WasmLimits::default()
         };
-        let mut loaded = load_program(wat.as_bytes(), 0, vec![], limits).unwrap();
+        let mut loaded = load_program(wat.as_bytes(), 0, vec![], vec![], vec![], limits).unwrap();
         let event = PuntEvent {
             now: std::time::Duration::ZERO,
             switch: crate::types::SwitchId::new(0),

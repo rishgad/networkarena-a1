@@ -61,8 +61,37 @@ what was over.
 | Counter arrays | 16 |
 | Slots per counter array | 4,096 |
 
-For scale: A1 worlds have between 5 and 15 switches, and one customer app
+For scale: worlds have between 5 and 15 switches, and one customer app
 on each. A correct solution needs tens of routes, not thousands.
+
+## Per switch, in memory
+
+| Limit | Value | What happens if you exceed it |
+|-------|-------|-------------------------------|
+| Linear memory, per switch | 128 MiB | The allocation fails, your program stops, and the run ends naming this ceiling. |
+
+This is a guard against one runaway allocation taking the grader down, not
+a budget to design against. Measured, not guessed: a complete solution
+peaks near **1 MiB**, on a 6-switch world and a 15-switch world alike,
+because what it holds is the allocator's own footprint rather than
+anything that grows with the network. The ceiling is about 100x that.
+
+If you ever hit it, the cause is almost certainly state that grows on every
+event and is never bounded: a record of every packet seen, or a map keyed by
+something that keeps changing.
+
+## Per program, in the data plane
+
+| Limit | Value | What happens if you exceed it |
+|-------|-------|-------------------------------|
+| TinyVM stages | 8 | The program is refused at load: "the program has N TinyVM stages; a pipeline has at most 8 -- recirculate instead". |
+
+A packet pays one stage's processing delay for every stage of the
+pipeline -- eight if your program has eight, four if it has four or
+fewer (the hardware pipeline is four deep; a shorter program does not
+make it faster). A program that needs more work per packet recirculates
+it, which costs a second pass through the whole pipeline and is the
+trade-off the assignment is about.
 
 ## Per stage, in the data plane
 
@@ -71,11 +100,48 @@ Each TinyVM stage declares its own budget when you build it:
 - `max_alu_ops` — arithmetic and logic operations the stage may run.
 - `max_memory_accesses` — table lookups, register and counter touches.
 
-These are yours to choose, but the simulator validates the stage against
-them before the run and rejects a program that cannot fit.
+These are yours to choose. The simulator does not currently reject a
+stage that exceeds its own declared budget; treat the numbers as
+documentation of what your stage intends to do.
+
+## Per switch, in buffer (Assignment 2)
+
+| Limit | Value | What happens if you exceed it |
+|-------|-------|-------------------------------|
+| Buffer pool, per switch | `buffer_budget_packets` x `packet_size_bytes` bytes, from the world's `[params]` (the handout's *[B]*: 40 x 1000 = 40,000 bytes) | The packet is dropped as `queue full`. Every port on the switch draws from this one pool. |
+| Queues per port | up to 16 | Larger `set_queues` lists are truncated. |
+| Queue cap, drop line, DRR weight | in full-size packets; whatever you ask for | A cap larger than the pool is harmless — the pool binds first. |
+
+A "packet" of cap or drop line is a full-size packet, `packet_size_bytes`
+bytes, and the pool and the queues are charged in bytes. Most customers
+send full-size packets; a customer whose row has its own `size_bytes`
+sends smaller ones (Jane Street and Fortnite: 200 bytes), an ack is 40
+bytes, and a packet your own controller injects is 20 bytes plus its
+payload. Each takes only its own size, so a queue capped at 4 packets
+holds 4 full-size packets or 20 of Fortnite's.
+
+You are told what you dropped: every `on_timer` carries `port_drops`, one
+entry per port that refused a packet since your previous timer, with the
+count, how many of those were your own drop threshold, and the split by
+queue. You are also told, at `init`, how fast the link on each of your
+ports is. Nothing else about queue state is reported; occupancy you must
+infer.
+
+## Control time (Assignment 2)
+
+Every action your controller returns — a route install, a queue
+configuration, a `link_down` — reaches the data plane
+`control_delay_us` (the handout's *[Δ]*) after the call that returned it,
+plus a few hundred nanoseconds of config-pipe serialization. Until then
+the switch runs on what it had.
 
 ## Not limited
 
-Wall-clock time, and how many packets you send. Control traffic you invent
+How many packets you send. Control traffic you invent
 is never counted as workload delivery — but it does consume link bandwidth
 like anything else, so flooding is not free.
+
+Grading additionally stops any single run that runs past a wall-clock limit,
+as a backstop against a program that hangs the simulator. A 60-second Part 2
+world simulates in well under a second, so the limit sits orders of magnitude
+above honest work and should never be something you think about.

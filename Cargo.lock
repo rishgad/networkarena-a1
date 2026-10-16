@@ -227,6 +227,7 @@ dependencies = [
  "clap",
  "postcard",
  "serde",
+ "serde_json",
  "switch_program_types",
  "tempfile",
  "toml",

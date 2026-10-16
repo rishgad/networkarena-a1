@@ -5,18 +5,18 @@
 //! show you the three things every switch program is made of, and then to
 //! get out of your way.
 //!
-//! Run it and read the report card:
+//! Run it and read the report card (the kit README has the exact command
+//! and the names of the practice worlds):
 //!
 //! ```text
 //! cargo build --release --target wasm32-unknown-unknown
-//! cargo run --features wasm --bin competitive_net_sim -- \
-//!     run-world worlds/practice/practice-ring-002.toml \
+//! ./target/release/competitive_net_sim run-world WORLD.toml \
 //!     --program target/wasm32-unknown-unknown/release/hello_switch.wasm \
 //!     --score
 //! ```
 //!
-//! You will see C1 delivery near 0% and C2 reachability at 0 pairs. Your
-//! job in Part 1 is to turn both of those green.
+//! You will see that nothing is delivered and that the card fails. Your
+//! job starts with turning that around.
 //!
 //! ## The three parts
 //!

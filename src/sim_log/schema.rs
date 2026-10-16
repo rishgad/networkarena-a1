@@ -15,7 +15,10 @@ use serde::{Deserialize, Serialize};
 use switch_program_types as wire;
 
 pub const LOG_MAGIC: u32 = 0x4E45_534D; // 'NESM' (Net-Event-Sim-Meta)
-pub const LOG_VERSION: u32 = 1;
+/// Version 2 added `DropReasonW::QueueFull` / `Policy` (appended, so
+/// version-1 logs still decode) and moved `PacketEgress` from queue
+/// admission to the moment the packet starts onto the wire.
+pub const LOG_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogFrame {
@@ -34,9 +37,14 @@ pub enum DropReasonW {
     Ttl,
     NoRoute,
     NoEgressLink,
+    /// Link down. (Logs before version 2 also used this for a full queue.)
     LinkDrop,
     SwitchFailed,
     Recirculation,
+    /// Egress queue or buffer pool full.
+    QueueFull,
+    /// The switch program dropped it on purpose.
+    Policy,
 }
 
 /// Compact mirror of the simulator's `SwitchConfig`. Includes only fields
@@ -73,6 +81,10 @@ pub struct PacketSnapshotW {
     pub ip_ttl: u8,
     pub label_top: u32,
     pub label_depth: u32,
+    /// Since log version 3: the flow and sequence number, so a scorer can
+    /// tell a first-time delivery from a retransmitted copy.
+    pub flow_id: u64,
+    pub seq: Option<u64>,
 }
 
 /// AS info for the BGP overlay (only used if `configure_bgp` ran).
@@ -174,9 +186,28 @@ pub enum LogEvent {
         table: u32,
         entry_id: u64,
     },
+    /// Pre-version-2 form; no longer emitted, kept so old logs decode.
     QueueConfigChanged {
         switch: u32,
         port: u16,
         capacity_bytes: u64,
+    },
+    /// A controller's `SetQueueConfig` landed on the data plane.
+    /// `queues` is the resulting shape in packets; `unit_bytes` is what
+    /// one packet was taken to be when caps were converted to bytes.
+    PortQueuesConfigured {
+        switch: u32,
+        port: u16,
+        discipline: u8,
+        unit_bytes: u64,
+        queues: Vec<wire::QueueSpecW>,
+    },
+    /// A controller's `DeclareLink` landed: the switch now says the link
+    /// on `port` is up (`true`) or down (`false`). Belief, not truth;
+    /// `LinkFailed` / `LinkRestored` are the truth.
+    LinkDeclared {
+        switch: u32,
+        port: u16,
+        up: bool,
     },
 }

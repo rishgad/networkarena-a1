@@ -49,6 +49,12 @@ pub struct Simulator {
     /// that slow down, or drop some traffic and forward the rest. Turn this
     /// on there if it earns its place.
     pub notify_link_events: bool,
+
+    /// The customer contract every program is handed at `init`: who the
+    /// customers are, how each one slows down, what each asks for. Set by
+    /// a world with customers before programs are installed; empty
+    /// otherwise.
+    pub customer_contract: Vec<switch_program_types::CustomerW>,
 }
 
 impl Simulator {
@@ -67,6 +73,7 @@ impl Simulator {
             trace: crate::trace::TraceManager::new(),
             log: None,
             notify_link_events: false,
+            customer_contract: Vec::new(),
         }
     }
 
@@ -95,7 +102,7 @@ impl Simulator {
             log.log(now_ns, crate::sim_log::LogEvent::SwitchAdded {
                 id: id.raw(),
                 owner: sw.owner.map(|o| o.raw()),
-                num_ports: sw.egress_queues.len() as u16,
+                num_ports: sw.egress.len() as u16,
                 config: switch_config_to_wire(&sw.config),
             });
         }
@@ -197,10 +204,20 @@ impl Simulator {
         self.trace.take(id)
     }
 
-    pub fn add_app(&mut self, app: App) {
+    pub fn add_app(&mut self, mut app: App) {
         let id = app.id;
         let ip = app.ip.0;
         let dst = app.destination.0;
+        // If the app's link was connected before the app was added, size
+        // its egress queue from that link now.
+        if let Some(cap) = self
+            .network
+            .link_at(Node::App(id), PortId::new(0))
+            .and_then(|l| self.links.get(&l))
+            .map(|l| l.config.queue_capacity_bytes)
+        {
+            Self::size_app_egress(&mut app, cap);
+        }
         self.apps.insert(id, app);
         // Schedule first tick immediately.
         self.queue.schedule(self.now, EventKind::AppTick { app: id });
@@ -214,7 +231,7 @@ impl Simulator {
     pub fn add_switch(&mut self, switch: Switch) {
         let id = switch.config.switch_id;
         let owner = switch.owner.map(|o| o.raw());
-        let num_ports = switch.egress_queues.len() as u16;
+        let num_ports = switch.egress.len() as u16;
         let cfg = switch_config_to_wire(&switch.config);
         self.switches.insert(id, switch);
         self.log_event(crate::sim_log::LogEvent::SwitchAdded {
@@ -255,6 +272,16 @@ impl Simulator {
                 port: b_port,
             },
         );
+        // An app's egress queue is the drop-tail queue at its end of the
+        // link: size it from the link. (Switches size theirs at
+        // construction.)
+        for n in [a_node, b_node] {
+            if let Node::App(a) = n {
+                if let Some(app) = self.apps.get_mut(&a) {
+                    Self::size_app_egress(app, config.queue_capacity_bytes);
+                }
+            }
+        }
         self.log_event(crate::sim_log::LogEvent::LinkAdded {
             id: id.raw(),
             a: nodeid_to_wire(a_node.as_node_id()),
@@ -264,6 +291,13 @@ impl Simulator {
             config: link_config_to_wire(&config),
         });
         id
+    }
+
+    fn size_app_egress(app: &mut App, queue_bytes: u64) {
+        for q in &mut app.egress.queues {
+            q.max_bytes = queue_bytes;
+        }
+        app.buffer_budget = queue_bytes;
     }
 
     /// Install an owner's WASM switch program on every switch they own.
@@ -295,10 +329,22 @@ impl Simulator {
         let mut loaded: Vec<(SwitchId, crate::wasm::LoadedProgram)> = Vec::new();
         for sid in &targets {
             let local_ports = self.local_ports_for_switch(*sid);
+            let port_capacity_bps = local_ports
+                .iter()
+                .map(|p| {
+                    self.network
+                        .link_at(Node::Switch(*sid), PortId::new(*p))
+                        .and_then(|l| self.links.get(&l))
+                        .map(|l| l.config.bandwidth_bps)
+                        .unwrap_or(0)
+                })
+                .collect();
             let lp = crate::wasm::load_program(
                 module_bytes,
                 sid.raw(),
                 local_ports,
+                port_capacity_bps,
+                self.customer_contract.clone(),
                 limits.clone(),
             )?;
             loaded.push((*sid, lp));
@@ -352,6 +398,7 @@ impl Simulator {
             self.handle(ev);
         }
         self.now = until.max(self.now);
+        self.finalize_metrics();
     }
 
     /// Run until queue empties.
@@ -359,6 +406,15 @@ impl Simulator {
         while let Some(ev) = self.queue.pop() {
             self.now = ev.time;
             self.handle(ev);
+        }
+        self.finalize_metrics();
+    }
+
+    /// Bring every app's summary metrics up to date. Runs at the end of
+    /// `run` / `run_until`; call it yourself after driving events by hand.
+    pub fn finalize_metrics(&mut self) {
+        for app in self.apps.values_mut() {
+            app.metrics.finalize();
         }
     }
 
@@ -371,8 +427,12 @@ impl Simulator {
                     packet_id: packet.id.raw(),
                 });
                 self.terminate_packet(&packet);
-                if let Some(a) = self.apps.get_mut(&app) {
-                    a.deliver(packet, self.now);
+                let ack = match self.apps.get_mut(&app) {
+                    Some(a) => a.deliver(packet, self.now),
+                    None => None,
+                };
+                if let Some(ack) = ack {
+                    self.send_from_app(app, ack);
                 }
             }
             EventKind::SwitchIngress {
@@ -390,13 +450,12 @@ impl Simulator {
             } => {
                 self.handle_pipeline_done(switch, port, queue, packet);
             }
-            EventKind::LinkSerializationDone { link, packet: _ } => {
-                if let Some(l) = self.links.get_mut(&link) {
-                    l.dequeue_head();
-                }
-            }
-            EventKind::LinkArrive { link, packet } => {
-                self.handle_link_arrive(link, packet);
+            EventKind::LinkSerializationDone {
+                link,
+                from_src,
+                packet,
+            } => {
+                self.handle_serialization_done(link, from_src, packet);
             }
             EventKind::PuntArrive {
                 switch,
@@ -413,112 +472,204 @@ impl Simulator {
 
     fn handle_app_tick(&mut self, app_id: AppId) {
         let now = self.now;
-        let (packet, next_delay) = {
-            let app = match self.apps.get_mut(&app_id) {
-                Some(a) => a,
-                None => return,
-            };
-            match app.tick(now) {
-                Some(x) => x,
-                None => return,
-            }
+        let out = match self.apps.get_mut(&app_id) {
+            Some(a) => a.tick(now),
+            None => return,
         };
 
         // Schedule the next tick.
-        self.queue
-            .schedule(now + next_delay, EventKind::AppTick { app: app_id });
+        if let Some(next_delay) = out.next {
+            self.queue
+                .schedule(now + next_delay, EventKind::AppTick { app: app_id });
+        }
 
         // Push packet onto the link out of this app.
-        self.send_from_app(app_id, packet);
+        if let Some(packet) = out.packet {
+            self.send_from_app(app_id, packet);
+        }
     }
 
     fn send_from_app(&mut self, app_id: AppId, packet: Packet) {
-        let link_id = match self
-            .network
-            .link_at(Node::App(app_id), PortId::new(0))
-        {
-            Some(l) => l,
-            None => return,
-        };
-        self.enqueue_on_link(link_id, packet, Node::App(app_id));
+        self.enqueue_at_port(Node::App(app_id), PortId::new(0), 0, packet);
     }
 
-    fn enqueue_on_link(&mut self, link_id: LinkId, packet: Packet, from: Node) {
-        let now = self.now;
-        let pid = packet.id;
-        let pkt_size = packet.size_bytes;
-        let (far_node_id, far_port, near_port_for_log, enqueue_outcome) = {
+    /// The egress port behind `(node, port)`, with the node's buffer pool
+    /// (`used`, `budget`). `None` if the node or port does not exist.
+    fn egress_mut(
+        &mut self,
+        node: Node,
+        port: PortId,
+    ) -> Option<(&mut crate::egress::EgressPort, &mut u64, u64)> {
+        match node {
+            Node::Switch(s) => {
+                let sw = self.switches.get_mut(&s)?;
+                let p = sw.egress.get_mut(port.raw() as usize)?;
+                Some((p, &mut sw.buffer_used, sw.buffer_budget))
+            }
+            Node::App(a) => {
+                let app = self.apps.get_mut(&a)?;
+                if port.raw() != 0 {
+                    return None;
+                }
+                Some((&mut app.egress, &mut app.buffer_used, app.buffer_budget))
+            }
+        }
+    }
+
+    /// Hand a packet to the egress port at `(node, port)`. It is admitted
+    /// into queue `queue` if the link is up and both the node's buffer pool
+    /// and the queue have room, and dropped (with a logged reason)
+    /// otherwise. Nothing about its departure is decided here: if the wire
+    /// is idle the port is kicked, and otherwise the packet waits for the
+    /// scheduler to pick it when the wire frees up.
+    fn enqueue_at_port(&mut self, node: Node, port: PortId, queue: u16, packet: Packet) {
+        let link_id = match self.network.link_at(node, port) {
+            Some(l) => l,
+            None => {
+                // An app with nothing plugged in just can't send. A switch
+                // forwarding out an unwired port is a routing bug worth a
+                // line on the card.
+                if let Node::Switch(s) = node {
+                    if let Some(sw) = self.switches.get_mut(&s) {
+                        sw.packets_dropped_no_egress += 1;
+                    }
+                    self.terminate_packet_with(
+                        &packet,
+                        Some(crate::trace::DropReason::NoEgressLink),
+                    );
+                }
+                return;
+            }
+        };
+
+        let from_src = {
             let link = match self.links.get_mut(&link_id) {
                 Some(l) => l,
                 None => return,
             };
-            let near_node = from.as_node_id();
-            let (far_node_id, far_port) = if link.src == near_node {
-                (link.dst, link.dst_port)
-            } else {
-                (link.src, link.src_port)
-            };
-            let near_port_for_log = if link.src == near_node {
-                link.src_port.raw()
-            } else {
-                link.dst_port.raw()
-            };
-            let outcome = link.enqueue(now, packet.clone());
-            (far_node_id, far_port, near_port_for_log, outcome)
+            let from_src = link.is_src(node.as_node_id());
+            if link.failed {
+                link.record_link_down_drop(from_src, packet.size_bytes);
+                self.terminate_packet_with(&packet, Some(crate::trace::DropReason::LinkDrop));
+                return;
+            }
+            from_src
         };
 
-        if let Some((ser_done, arrive)) = enqueue_outcome {
-            // The serialization-done event triggers dequeuing the head.
-            self.queue.schedule(
-                ser_done,
-                EventKind::LinkSerializationDone {
-                    link: link_id,
-                    packet: packet.clone(),
-                },
-            );
-
-            // Log the egress (the packet is now committed to this link).
-            // App-originated packets skip this event; the viewer infers
-            // them from the next-hop ingress.
-            if let Node::Switch(s) = from {
-                self.log_event(crate::sim_log::LogEvent::PacketEgress {
-                    switch: s.raw(),
-                    port: near_port_for_log,
-                    link: link_id.raw(),
-                    packet_id: pid.raw(),
-                    size_bytes: pkt_size,
-                    arrive_at_ns: arrive.as_nanos() as u64,
-                });
+        let size = packet.size_bytes;
+        let idle = {
+            let (egress, used, budget) = match self.egress_mut(node, port) {
+                Some(x) => x,
+                None => return,
+            };
+            match egress.admit(queue as usize, packet, *used, budget) {
+                Ok(()) => {
+                    *used += size;
+                    !egress.transmitting
+                }
+                Err((refused, why)) => {
+                    // Without this the packet just disappears and the
+                    // report card has no answer for where it went. A
+                    // threshold drop is the program's choice and is
+                    // reported as such; the other two are a lack of room.
+                    let reason = match why {
+                        crate::egress::Refusal::Threshold => crate::trace::DropReason::Policy,
+                        _ => crate::trace::DropReason::QueueFull,
+                    };
+                    self.terminate_packet_with(&refused, Some(reason));
+                    return;
+                }
             }
-            // We need to also deliver the packet at `arrive`.
-            // Resolve far node back to a switch or app by peeking nodeid.
-            if (far_node_id.raw() & 0x8000_0000) != 0 {
-                let switch_id = SwitchId::new(far_node_id.raw() & 0x7fff_ffff);
-                self.queue.schedule(
-                    arrive,
-                    EventKind::SwitchIngress {
-                        switch: switch_id,
-                        port: far_port,
-                        packet,
-                    },
-                );
-            } else {
-                let app_id = AppId::new(far_node_id.raw());
-                self.queue.schedule(
-                    arrive,
-                    EventKind::AppDeliver {
-                        app: app_id,
-                        packet,
-                    },
-                );
-            }
-            let _ = pid;
-        } else {
-            // The link refused it: it is down, or its queue is full. Without
-            // this the packet just disappears and the report card has no
-            // answer for where it went.
-            self.terminate_packet_with(&packet, Some(crate::trace::DropReason::LinkDrop));
+        };
+        if idle {
+            self.start_wire(node, port, link_id, from_src);
         }
+    }
+
+    /// The wire out of `(node, port)` is idle: ask the port's scheduler
+    /// for the next packet and start serializing it. This is the one place
+    /// a packet's departure is decided.
+    fn start_wire(&mut self, node: Node, port: PortId, link_id: LinkId, from_src: bool) {
+        let packet = {
+            let (egress, _, _) = match self.egress_mut(node, port) {
+                Some(x) => x,
+                None => return,
+            };
+            match egress.pick_next() {
+                Some(p) => {
+                    egress.transmitting = true;
+                    p
+                }
+                None => {
+                    egress.transmitting = false;
+                    return;
+                }
+            }
+        };
+
+        let (ser_done, arrive) = match self.links.get(&link_id) {
+            Some(l) => l.config.transmit_times(self.now, packet.size_bytes),
+            None => return,
+        };
+
+        // Log the egress: the packet is now on the wire. App-originated
+        // packets skip this event; the viewer infers them from the
+        // next-hop ingress.
+        if let Node::Switch(s) = node {
+            self.log_event(crate::sim_log::LogEvent::PacketEgress {
+                switch: s.raw(),
+                port: port.raw(),
+                link: link_id.raw(),
+                packet_id: packet.id.raw(),
+                size_bytes: packet.size_bytes,
+                arrive_at_ns: arrive.as_nanos() as u64,
+            });
+        }
+
+        self.queue.schedule(
+            ser_done,
+            EventKind::LinkSerializationDone {
+                link: link_id,
+                from_src,
+                packet,
+            },
+        );
+    }
+
+    /// The packet has fully left the sending port. Release its buffer,
+    /// put it on the far end's doorstep after the propagation delay, and
+    /// pull the port's next packet.
+    fn handle_serialization_done(&mut self, link_id: LinkId, from_src: bool, packet: Packet) {
+        let (near, near_port, far, far_port, latency) = match self.links.get(&link_id) {
+            Some(l) => {
+                let (n, np) = l.near_end(from_src);
+                let (f, fp) = l.far_end(from_src);
+                (Node::from_node_id(n), np, Node::from_node_id(f), fp, l.config.latency)
+            }
+            None => return,
+        };
+
+        if let Some((egress, used, _)) = self.egress_mut(near, near_port) {
+            *used = used.saturating_sub(packet.size_bytes);
+            egress.transmitting = false;
+        }
+
+        let arrive = self.now + latency;
+        match far {
+            Node::Switch(switch) => self.queue.schedule(
+                arrive,
+                EventKind::SwitchIngress {
+                    switch,
+                    port: far_port,
+                    packet,
+                },
+            ),
+            Node::App(app) => self
+                .queue
+                .schedule(arrive, EventKind::AppDeliver { app, packet }),
+        };
+
+        self.start_wire(near, near_port, link_id, from_src);
     }
 
     fn handle_switch_ingress(&mut self, switch_id: SwitchId, port: PortId, mut packet: Packet) {
@@ -586,7 +737,7 @@ impl Simulator {
                 );
             }
             PipelineOutcome::Drop => {
-                self.terminate_packet_with(&packet, Some(crate::trace::DropReason::NoRoute));
+                self.terminate_packet_with(&packet, Some(crate::trace::DropReason::Policy));
             }
             PipelineOutcome::Punt(reason) => {
                 // Queue on punt pipe; arrives at CPU after latency + serialization.
@@ -657,29 +808,10 @@ impl Simulator {
         &mut self,
         switch_id: SwitchId,
         port: PortId,
-        _queue: u16,
+        queue: u16,
         packet: Packet,
     ) {
-        // Find link out of this port.
-        let link_id = match self
-            .network
-            .link_at(Node::Switch(switch_id), port)
-        {
-            Some(l) => l,
-            None => {
-                if let Some(s) = self.switches.get_mut(&switch_id) {
-                    s.packets_dropped_no_egress += 1;
-                }
-                self.terminate_packet_with(&packet, Some(crate::trace::DropReason::NoEgressLink));
-                return;
-            }
-        };
-        self.enqueue_on_link(link_id, packet, Node::Switch(switch_id));
-    }
-
-    fn handle_link_arrive(&mut self, _link: LinkId, _packet: Packet) {
-        // Currently `LinkArrive` is unused — `enqueue_on_link` schedules
-        // delivery directly to far node. Kept for future hook points.
+        self.enqueue_at_port(Node::Switch(switch_id), port, queue, packet);
     }
 
     fn handle_punt_arrive(
@@ -730,7 +862,8 @@ impl Simulator {
             if switch.failed || switch.cpu.failed {
                 return;
             }
-            switch.controller.on_timer(now)
+            let drops = switch.take_drop_deltas();
+            switch.controller.on_timer_with_drops(now, drops)
         };
         self.dispatch_actions(switch_id, actions);
     }
@@ -775,19 +908,19 @@ impl Simulator {
     fn handle_config_arrive(&mut self, switch_id: SwitchId, action: ControllerAction) {
         // Inject-packet actions need simulator-level scheduling.
         match action {
-            ControllerAction::InjectPacket { packet, port } => {
-                let link_id = match self
-                    .network
-                    .link_at(Node::Switch(switch_id), port)
-                {
-                    Some(l) => l,
-                    None => return,
-                };
-                self.enqueue_on_link(link_id, packet, Node::Switch(switch_id));
+            ControllerAction::InjectPacket { packet, port, queue } => {
+                self.enqueue_at_port(Node::Switch(switch_id), port, queue.raw(), packet);
             }
             ControllerAction::ScheduleTimer { delay } => {
                 let at = self.now + delay;
                 self.queue.schedule(at, EventKind::ControllerTimer { switch: switch_id });
+            }
+            ControllerAction::DeclareLink { port, up } => {
+                self.log_event(crate::sim_log::LogEvent::LinkDeclared {
+                    switch: switch_id.raw(),
+                    port: port.raw(),
+                    up,
+                });
             }
             ControllerAction::InstallTableEntry { table_id, entry } => {
                 let event = crate::sim_log::LogEvent::TableEntryInstalled {
@@ -811,13 +944,30 @@ impl Simulator {
                 });
             }
             ControllerAction::SetQueueConfig { port, config } => {
-                if let Some(s) = self.switches.get_mut(&switch_id) {
-                    s.apply_action(ControllerAction::SetQueueConfig { port, config: config.clone() });
-                }
-                self.log_event(crate::sim_log::LogEvent::QueueConfigChanged {
+                let unit_bytes = match self.switches.get_mut(&switch_id) {
+                    Some(s) => {
+                        s.apply_action(ControllerAction::SetQueueConfig {
+                            port,
+                            config: config.clone(),
+                        });
+                        s.packet_size_bytes
+                    }
+                    None => return,
+                };
+                self.log_event(crate::sim_log::LogEvent::PortQueuesConfigured {
                     switch: switch_id.raw(),
                     port: port.raw(),
-                    capacity_bytes: config.capacity_bytes,
+                    discipline: config.discipline.to_u8(),
+                    unit_bytes,
+                    queues: config
+                        .queues
+                        .iter()
+                        .map(|q| switch_program_types::QueueSpecW {
+                            max_packets: q.max_packets,
+                            weight: q.weight,
+                            drop_threshold_packets: q.drop_threshold_packets.unwrap_or(0),
+                        })
+                        .collect(),
                 });
             }
         }
@@ -1041,15 +1191,9 @@ impl Simulator {
         };
         // Determine the other endpoint of the link — whoever is on the
         // far side of `mark_switch` is the "magical" sender of the reply.
-        let me_node_id = Node::Switch(mark_switch).as_node_id();
-        let far_is_dst = link.src == me_node_id;
-        let far_node_id = if far_is_dst { link.dst } else { link.src };
-        // Reconstruct the far Node enum so enqueue_on_link routes correctly.
-        let far_node = if (far_node_id.raw() & 0x8000_0000) != 0 {
-            Node::Switch(SwitchId::new(far_node_id.raw() & 0x7fff_ffff))
-        } else {
-            Node::App(AppId::new(far_node_id.raw()))
-        };
+        let me_is_src = link.is_src(Node::Switch(mark_switch).as_node_id());
+        let (far_node_id, far_port) = link.far_end(me_is_src);
+        let far_node = Node::from_node_id(far_node_id);
 
         // Build the TraceReply payload.
         let hops: Vec<switch_program_types::TraceHopW> = original
@@ -1069,6 +1213,8 @@ impl Simulator {
             Some(crate::trace::DropReason::LinkDrop) => 4,
             Some(crate::trace::DropReason::SwitchFailed) => 5,
             Some(crate::trace::DropReason::Recirculation) => 6,
+            Some(crate::trace::DropReason::QueueFull) => 7,
+            Some(crate::trace::DropReason::Policy) => 8,
         };
         let reply_wire = switch_program_types::TraceReplyW {
             mark_switch: mark_switch.raw(),
@@ -1096,9 +1242,9 @@ impl Simulator {
         // its own termination would synthesize another reply.
         reply.trail = crate::packet::PacketTrail::default();
 
-        // Enqueue on the link "from" the far end so the SwitchIngress
-        // event lands on the marking switch at `mark_port`.
-        self.enqueue_on_link(link_id, reply, far_node);
+        // Send from the far end's port so the SwitchIngress event lands
+        // on the marking switch at `mark_port`.
+        self.enqueue_at_port(far_node, far_port, 0, reply);
     }
 
 
@@ -1165,6 +1311,8 @@ pub(crate) fn drop_reason_to_wire(r: crate::trace::DropReason) -> crate::sim_log
         crate::trace::DropReason::LinkDrop => crate::sim_log::DropReasonW::LinkDrop,
         crate::trace::DropReason::SwitchFailed => crate::sim_log::DropReasonW::SwitchFailed,
         crate::trace::DropReason::Recirculation => crate::sim_log::DropReasonW::Recirculation,
+        crate::trace::DropReason::QueueFull => crate::sim_log::DropReasonW::QueueFull,
+        crate::trace::DropReason::Policy => crate::sim_log::DropReasonW::Policy,
     }
 }
 
@@ -1195,6 +1343,8 @@ pub(crate) fn packet_snapshot(p: &crate::packet::Packet) -> crate::sim_log::Pack
         ip_ttl: p.ip_ttl,
         label_top: p.labels.last().copied().unwrap_or(0),
         label_depth: p.labels.len() as u32,
+        flow_id: p.flow_id.raw(),
+        seq: p.seq,
     }
 }
 

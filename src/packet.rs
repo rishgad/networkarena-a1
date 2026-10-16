@@ -12,6 +12,9 @@ pub enum PacketKind {
     SimpleBgp,
     TraceProbe,
     TraceReply,
+    /// A customer's acknowledgement of one data packet, carrying the
+    /// acknowledged `seq`. Small, and never counted as workload.
+    Ack,
 }
 
 impl PacketKind {
@@ -21,6 +24,7 @@ impl PacketKind {
             PacketKind::SimpleBgp => 1,
             PacketKind::TraceProbe => 2,
             PacketKind::TraceReply => 3,
+            PacketKind::Ack => 4,
         }
     }
 
@@ -29,6 +33,7 @@ impl PacketKind {
             1 => PacketKind::SimpleBgp,
             2 => PacketKind::TraceProbe,
             3 => PacketKind::TraceReply,
+            4 => PacketKind::Ack,
             _ => PacketKind::Data,
         }
     }
@@ -118,6 +123,12 @@ pub struct Packet {
     pub app_id: AppId,
     pub flow_id: FlowId,
 
+    /// Sequence number within `flow_id`, for customers that run a closed
+    /// loop: a retransmission carries the same `(flow_id, seq)` under a
+    /// fresh `id`, and an `Ack` names the `seq` it acknowledges. `None`
+    /// for open-loop traffic and control packets.
+    pub seq: Option<u64>,
+
     pub custom: [u64; 4],
 
     /// What this packet is. Visible to TinyVM via `PacketField::Kind`.
@@ -162,6 +173,7 @@ impl Packet {
             dst_port: None,
             app_id: AppId::default(),
             flow_id: FlowId::default(),
+            seq: None,
             custom: [0; 4],
             kind: PacketKind::Data,
             labels: Vec::new(),

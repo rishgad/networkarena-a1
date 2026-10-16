@@ -95,20 +95,24 @@ sim.connect(
 );
 ```
 
-`connect` is bidirectional in the sense that either endpoint can send on
-the link, but each link still has only one drop-tail queue (shared between
-directions in the current model — adequate for one-way flows; if you need
-independent queues per direction, create two links).
+A link is full-duplex: each direction has its own wire, and traffic one
+way never waits for, or takes buffer from, traffic the other way.
 
 A `LinkConfig` models:
 
 - **propagation latency** — fixed delay added after serialization
 - **serialization delay** — `size_bytes * 8 / bandwidth_bps`, so larger
   packets back-to-back queue up behind each other
-- **drop-tail queue** — bounded by `queue_capacity_bytes`; over-capacity
-  enqueues drop the packet and bump `Link::packets_dropped`
+- **egress queue size** — `queue_capacity_bytes` sizes the drop-tail
+  queue at an *app's* end of the link. Switch ports are sized at
+  `Switch::new`.
 
-Packets emerge from a link in the same order they were enqueued.
+The queue itself belongs to the sending node's **egress port**
+(`egress.rs`), not to the link. A packet is admitted if the port's queue
+and the node's shared buffer pool both have room, and dropped with reason
+`QueueFull` otherwise; when the wire goes idle the port's scheduler picks
+the next packet to serialize. With the default single FIFO queue packets
+leave in arrival order, exactly like a drop-tail link.
 
 A switch's egress port routes via the link registered for
 `(Node::Switch(switch_id), port)`. If no link is attached to that port the

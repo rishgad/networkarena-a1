@@ -189,7 +189,7 @@ fn trace_reply_returns_path_and_charges_bandwidth() {
     // counter we can read directly, but the reply payload size is known.
     let sim_link = sim.links.get(&l0).unwrap();
     // Defensive: link should not have dropped any packet.
-    assert_eq!(sim_link.packets_dropped, 0);
+    assert_eq!(sim_link.packets_dropped(), 0);
     let _ = LinkId::new(0); // silence unused
 }
 
@@ -249,6 +249,6 @@ fn trace_reply_when_packet_is_dropped_records_drop_reason() {
     assert_eq!(captured.payloads.len(), 1);
     let reply: TraceReplyW = postcard::from_bytes(&captured.payloads[0]).unwrap();
     assert!(!reply.delivered);
-    assert_eq!(reply.drop_reason, 2); // NoRoute (Drop -> NoRoute mapping)
+    assert_eq!(reply.drop_reason, 8); // Policy: the program chose to drop it
     assert_eq!(reply.hops.last().unwrap().switch_id, 2);
 }
